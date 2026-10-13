@@ -1,0 +1,867 @@
+id: etcd-snapshot-restore-drill
+namespace: company.team
+description: |
+  Prove that etcd backups restore. Take a snapshot, verify its hash, restore
+  it into a throwaway member, start it, and compare key count, revision and a
+  sample of keys with the live cluster at the snapshot's revision. Also watch
+  database size against --quota-backend-bytes and the NOSPACE/CORRUPT alarms,
+  and with on-call approval compact, defragment one member at a time
+  (followers first, leader last) and disarm the alarm.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: alertmanager
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: |
+      Point Alertmanager at this (etcd mixin alerts such as etcdDatabaseQuotaLowSpace, etcdMembersDown or
+      etcdNoLeader), or call it after a change: curl -X POST http://localhost:8080/api/v1/main/executions/webhook/company.team/etcd-snapshot-restore-drill/etcd-drill-change-me
+    key: etcd-drill-change-me
+  - id: nightly_drill
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: The restore drill every night. Enable it once the secrets and inputs fit your cluster.
+    cron: "40 2 * * *"
+    disabled: true
+
+inputs:
+  - id: cluster_name
+    type: STRING
+    defaults: main
+    description: Name used in messages and in the KV key that remembers the last state; use one per cluster.
+  - id: endpoints
+    type: STRING
+    defaults: http://127.0.0.1:2379,http://127.0.0.1:22379,http://127.0.0.1:32379
+    description: Comma-separated client URLs used to discover the members. Each member is then checked on its own advertised client URL, so one reachable endpoint is enough.
+  - id: etcd_version
+    type: STRING
+    defaults: v3.5.17
+    description: Tag of quay.io/coreos/etcd whose etcdctl, etcdutl and etcd are used. Match your cluster's minor version.
+  - id: tls
+    type: BOOL
+    defaults: false
+    description: Turn on for clusters with client TLS (all Kubernetes control planes); the CA, client certificate and key come from secrets.
+  - id: quota_warn_percent
+    type: FLOAT
+    defaults: 70
+    description: Warn when a member's database file passes this share of its --quota-backend-bytes. At 100% etcd raises NOSPACE and refuses writes.
+  - id: quota_critical_percent
+    type: FLOAT
+    defaults: 90
+    description: Critical level; on-call is offered compaction and defragmentation.
+  - id: default_quota_mb
+    type: INT
+    defaults: 2048
+    description: Quota in MiB assumed when a member's /metrics cannot be read. 2048 (2 GiB) is etcd's default.
+  - id: fragmentation_percent
+    type: INT
+    defaults: 50
+    description: Also offer defragmentation when at least this share of a member's file is free pages...
+  - id: fragmentation_min_mb
+    type: INT
+    defaults: 100
+    description: ...and those free pages are at least this many MiB, so small clusters are not defragmented for nothing.
+  - id: sample_keys
+    type: INT
+    defaults: 50
+    description: Number of random keys whose value and revisions are compared between the restored member and the live cluster.
+  - id: keep_snapshot
+    type: BOOL
+    defaults: true
+    description: Keep the verified snapshot as an output file of the run (in Kestra's internal storage, so S3/GCS/Azure if configured). Turn off if another tool keeps your backups.
+  - id: snapshot
+    type: FILE
+    required: false
+    description: Optional. Drill an existing backup (a file written by etcdctl snapshot save) instead of taking a new snapshot.
+  - id: defrag_timeout_seconds
+    type: INT
+    defaults: 600
+    description: Timeout for defragmenting one member. A member is blocked while it defragments; large databases take minutes.
+  - id: ask_again_hours
+    type: INT
+    defaults: 6
+    description: Wait this long before offering the same maintenance again after nobody acted.
+  - id: docker_network
+    type: STRING
+    defaults: host
+    description: Docker network of the etcdctl containers. host reaches etcd on the Kestra host; use bridge or a named network if etcd is reachable from there.
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for links in messages.
+
+variables:
+  # Shared by every Python task (written next to each script as etcdlib.py).
+  etcdlib: |
+    import json, os, re, ssl, subprocess, sys, time, urllib.request
+
+    TLS = os.environ.get("ETCD_TLS") == "true"
+    TLS_FILES = {}
+    if TLS:
+        for name, flag in (("ETCD_CA_CERT", "--cacert"), ("ETCD_CLIENT_CERT", "--cert"), ("ETCD_CLIENT_KEY", "--key")):
+            path = "/tmp/" + name.lower() + ".pem"
+            with open(path, "w") as f:
+                f.write(os.environ.get(name, ""))
+            os.chmod(path, 0o600)
+            TLS_FILES[flag] = path
+    TLS_ARGS = [x for kv in TLS_FILES.items() for x in kv]
+    ALARMS = {"1": "NOSPACE", "2": "CORRUPT", "NOSPACE": "NOSPACE", "CORRUPT": "CORRUPT"}
+
+    class EtcdError(Exception):
+        pass
+
+    def _one_line(kind, value, tb):
+        # the first ERROR line is what the errors alert quotes, so make it the cause, not "Traceback"
+        import traceback
+        print("".join(traceback.format_exception(kind, value, tb)))
+        print("%s: %s" % (kind.__name__, value), file=sys.stderr)
+    sys.excepthook = _one_line
+
+    def short(text):
+        # etcdctl prints JSON log lines and then "Error: ...", bbolt panics with "panic: ...": keep that line.
+        lines = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
+        for prefix in ("Error:", "panic:"):
+            for l in reversed(lines):
+                if l.startswith(prefix):
+                    return l[len(prefix):].strip()[:300]
+        return (lines[-1] if lines else "no output")[:300]
+
+    def explain_hash(message):
+        if "expected sha256" in message:
+            return "its SHA-256 does not match the one etcdctl snapshot save appended: the file changed after it was written"
+        if "missing hash" in message:
+            return "it has no SHA-256 trailer: the file is truncated, or it is a raw copy of member/snap/db instead of etcdctl snapshot save output"
+        return message
+
+    def run(cmd, timeout):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise EtcdError("%s timed out after %ds" % (" ".join(cmd[:3]), timeout))
+        return p
+
+    def ctl(args, endpoints, timeout=10, json_out=True, tolerate_failure=False, tls=True):
+        cmd = ["etcdctl", "--endpoints=" + endpoints, "--dial-timeout=3s", "--command-timeout=%ds" % timeout] + (TLS_ARGS if tls else [])
+        cmd += (["-w", "json"] if json_out else []) + list(args)
+        p = run(cmd, timeout + 15)
+        if p.returncode != 0 and not (tolerate_failure and p.stdout.strip().startswith(("[", "{"))):
+            raise EtcdError(short(p.stderr or p.stdout))
+        if not json_out:
+            return p.stdout
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            raise EtcdError("etcdctl did not return JSON: " + short(p.stdout + p.stderr))
+
+    def http(endpoint, path, body=None):
+        ctx = None
+        if endpoint.startswith("https"):
+            ctx = ssl.create_default_context(cafile=TLS_FILES.get("--cacert"))
+            if TLS:
+                ctx.load_cert_chain(TLS_FILES["--cert"], TLS_FILES["--key"])
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+        data = json.dumps(body).encode() if body is not None else None
+        return opener.open(urllib.request.Request(endpoint.rstrip("/") + path, data, {"Content-Type": "application/json"}), timeout=5).read().decode()
+
+    def member_list(seeds):
+        try:
+            return ctl(["member", "list"], seeds)
+        except EtcdError as e:
+            first = e
+        # etcdctl's member list needs quorum; the v3 API can answer from one member's local view
+        for seed in seeds.split(","):
+            try:
+                listing = json.loads(http(seed.strip(), "/v3/cluster/member/list", {"linearizable": False}))
+                for m in listing.get("members", []):
+                    m["ID"] = int(m["ID"])
+                return listing
+            except Exception:
+                pass
+        raise EtcdError("no endpoint in %s answered: %s" % (seeds, first))
+
+    def metric(endpoint, name):
+        try:
+            body = http(endpoint, "/metrics")
+        except Exception:
+            return None
+        m = re.search(r"^" + name + r" (\S+)$", body, re.M)
+        return int(float(m.group(1))) if m else None
+
+    def mib(n):
+        return "%.1f MiB" % (n / 1048576.0)
+
+    def output(**kw):
+        print("::" + json.dumps({"outputs": kw}) + "::")
+
+    def fail(message):
+        print(message, file=sys.stderr)
+        sys.exit(1)
+
+    def probe(seeds, default_quota, warn, critical):
+        """Discover the members and read each one's status, health, quota and alarms."""
+        listing = member_list(seeds)
+        members = []
+        for m in listing.get("members", []):
+            rec = {"id": "%x" % m["ID"], "name": m.get("name") or "(not started)",
+                   "endpoint": (m.get("clientURLs") or [""])[0], "learner": bool(m.get("isLearner")),
+                   "up": False, "healthy": False, "leader": False, "leader_id": "0", "error": ""}
+            members.append(rec)
+            if not rec["endpoint"]:
+                rec["error"] = "added to the cluster but never started"
+                continue
+            try:
+                st = ctl(["endpoint", "status"], rec["endpoint"], timeout=5)[0]["Status"]
+            except EtcdError as e:
+                rec["error"] = str(e)
+                continue
+            quota = metric(rec["endpoint"], "etcd_server_quota_backend_bytes")
+            size, in_use = st.get("dbSize", 0), st.get("dbSizeInUse", 0)
+            rec.update(up=True, leader=st.get("leader") == st["header"]["member_id"], leader_id="%x" % st.get("leader", 0),
+                       version=st.get("version", ""), revision=st["header"].get("revision", 0),
+                       raft_index=st.get("raftIndex", 0), applied_index=st.get("raftAppliedIndex", 0),
+                       db_size=size, db_in_use=in_use, free_bytes=max(size - in_use, 0),
+                       free_percent=round(100.0 * max(size - in_use, 0) / size, 1) if size else 0.0,
+                       quota=quota or default_quota, quota_source="metrics" if quota else "assumed default",
+                       status_errors=st.get("errors", []))
+            rec["used_percent"] = round(100.0 * size / rec["quota"], 1)
+            rec["level"] = "critical" if rec["used_percent"] >= critical else "warn" if rec["used_percent"] >= warn else "ok"
+            try:
+                h = ctl(["endpoint", "health"], rec["endpoint"], timeout=5, tolerate_failure=True)[0]
+                rec["healthy"] = bool(h.get("health"))
+                rec["error"] = "" if rec["healthy"] else h.get("error", "unhealthy")
+            except EtcdError as e:
+                rec["error"] = str(e)
+        names = {m["id"]: m["name"] for m in members}
+        alarms = []
+        up = ",".join(m["endpoint"] for m in members if m["up"])
+        voting = [m for m in members if not m["learner"]]
+        quorum = len([m for m in voting if m["up"]]) > len(voting) // 2
+        if up and quorum:
+            try:
+                for a in ctl(["alarm", "list"], up, timeout=5).get("alarms", []):
+                    alarms.append({"member": names.get("%x" % a.get("memberID", 0), "%x" % a.get("memberID", 0)),
+                                   "alarm": ALARMS.get(str(a.get("alarm")), str(a.get("alarm")))})
+            except EtcdError as e:
+                alarms.append({"member": "?", "alarm": "UNKNOWN (alarm list failed: %s)" % e})
+        members.sort(key=lambda m: m["name"])
+        voting_up = [m for m in voting if m["up"]]
+        leaders = sorted(set(m["leader_id"] for m in voting_up))
+        leader = next((m["name"] for m in members if m["leader"]), "")
+        return {"members": members, "alarms": alarms, "voting": len(voting), "voting_up": len(voting_up),
+                "quorum": quorum, "alarms_known": quorum, "leader": leader,
+                "agreed_leader": len(leaders) == 1 and leaders[0] != "0",
+                "revision": max([m.get("revision", 0) for m in members] or [0])}
+
+    def ready(report):
+        """Every voting member answers and all agree on one leader: safe to block one member for maintenance."""
+        down = [m["name"] for m in report["members"] if not m["learner"] and not m["up"]]
+        if down:
+            return False, "%s not responding" % ", ".join(down)
+        if not report["agreed_leader"]:
+            return False, "members do not agree on a leader"
+        return True, ""
+
+tasks:
+  - id: build_tools
+    type: io.kestra.plugin.docker.Build
+    description: |
+      The official etcd image is distroless (no shell), so copy its etcdctl, etcdutl and etcd binaries into a
+      Python image once. Docker's layer cache makes later runs instant.
+    pull: false
+    tags:
+      - "kestra-etcd-tools:{{ inputs.etcd_version }}"
+    dockerfile: |
+      FROM quay.io/coreos/etcd:{{ inputs.etcd_version }} AS etcd
+      FROM python:3.12-slim
+      COPY --from=etcd /usr/local/bin/etcd /usr/local/bin/etcdctl /usr/local/bin/etcdutl /usr/local/bin/
+
+  - id: probe
+    type: io.kestra.plugin.scripts.python.Script
+    description: Discover the members and read each one's health, leader, revision, database size, free pages and quota, plus the cluster's alarms.
+    containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+    pythonVersion: "3.12"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.docker_network }}"
+      pullPolicy: IF_NOT_PRESENT
+    retry:
+      type: exponential
+      interval: PT5S
+      maxInterval: PT30S
+      maxAttempts: 3
+    inputFiles:
+      etcdlib.py: "{{ vars.etcdlib }}"
+    env:
+      ETCD_TLS: "{{ inputs.tls }}"
+      ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+      ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+      ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+    script: |
+      from etcdlib import *
+      try:
+          report = probe("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }})
+      except EtcdError as e:
+          fail("Cannot reach the etcd cluster: %s. Check the endpoints input, the docker_network input and TLS." % e)
+      for m in report["members"]:
+          if m["up"]:
+              print("%s %s%s: rev %s, %s of %s quota (%s%%, %s), %s free, healthy=%s %s" % (m["name"], m["endpoint"], " (leader)" if m["leader"] else "",
+                    m["revision"], mib(m["db_size"]), mib(m["quota"]), m["used_percent"], m["quota_source"], mib(m["free_bytes"]), m["healthy"], m["error"]))
+          else:
+              print("%s %s: DOWN %s" % (m["name"], m["endpoint"], m["error"]))
+      print("alarms: %s" % (report["alarms"] or "none"))
+      output(report=report)
+
+  - id: drill
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Take a snapshot from a healthy follower (or drill the uploaded file), check its hash, restore it into a
+      throwaway single-member cluster on 127.0.0.1 inside the container, start it, and compare it with the live
+      cluster read at the snapshot's revision (MVCC), so writes made since the snapshot do not count as differences.
+    containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+    pythonVersion: "3.12"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: "{{ inputs.docker_network }}"
+      pullPolicy: IF_NOT_PRESENT
+    timeout: PT1H
+    inputFiles:
+      etcdlib.py: "{{ vars.etcdlib }}"
+      existing.db: "{{ inputs.snapshot ?? '' }}"
+    outputFiles:
+      - snapshot.db
+    env:
+      HEALTH: "{{ outputs.probe.vars.report | toJson }}"
+      ETCD_TLS: "{{ inputs.tls }}"
+      ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+      ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+      ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+    script: |
+      import base64, hashlib, random, shutil
+      from etcdlib import *
+
+      health = json.loads(os.environ["HEALTH"])
+      members = health["members"]
+      source = (next((m for m in members if m["healthy"] and not m["leader"] and not m["learner"]), None)
+                or next((m for m in members if m["healthy"]), None) or next((m for m in members if m["up"]), None))
+      if source is None:
+          fail("No etcd member is up: nothing to snapshot.")
+      existing = os.path.exists("existing.db") and os.path.getsize("existing.db") > 0
+      r = {"mode": "uploaded file" if existing else "new snapshot", "source": source["name"], "problems": [], "notes": []}
+      problems, notes = r["problems"], r["notes"]
+      SCRATCH = "http://127.0.0.1:52379"
+      PEER = "http://127.0.0.1:52380"
+
+      def done():
+          r["verdict"] = "FAIL" if problems else "PASS"
+          if not {{ inputs.keep_snapshot ? 'True' : 'False' }} and os.path.exists("snapshot.db"):
+              os.remove("snapshot.db")
+          print("verdict: %s %s" % (r["verdict"], "; ".join(problems)))
+          output(report=r)
+          sys.exit(0)
+
+      # 1. snapshot
+      t = time.time()
+      if existing:
+          shutil.copy("existing.db", "snapshot.db")
+      else:
+          try:
+              ctl(["snapshot", "save", "snapshot.db"], source["endpoint"], timeout=1800, json_out=False)
+          except EtcdError as e:
+              problems.append("snapshot save from %s failed: %s" % (source["name"], e))
+              done()
+      r["save_seconds"] = round(time.time() - t, 2)
+
+      # 2. integrity: etcdutl reads the whole bolt file and computes its hash
+      p = run(["etcdutl", "snapshot", "status", "snapshot.db", "-w", "json"], 600)
+      if p.returncode != 0:
+          problems.append("the file is corrupt (bbolt check: %s)" % short(p.stderr or p.stdout)[:160])
+          q = run(["etcdutl", "snapshot", "restore", "snapshot.db", "--data-dir", "/tmp/hashcheck"], 600)
+          if q.returncode != 0:
+              problems.append(explain_hash(short(q.stderr or q.stdout)))
+          done()
+      st = json.loads(p.stdout)
+      r["snapshot"] = {"revision": st["revision"], "total_keys": st["totalKey"], "size": mib(st["totalSize"]), "hash": "%08x" % st["hash"],
+                       "sha256": hashlib.sha256(open("snapshot.db", "rb").read()).hexdigest()[:16]}
+      rev = st["revision"]
+
+      # 3. restore into a new single-member cluster; restore also checks the SHA-256 that snapshot save appends
+      shutil.rmtree("/tmp/drill", ignore_errors=True)
+      t = time.time()
+      p = run(["etcdutl", "snapshot", "restore", "snapshot.db", "--data-dir", "/tmp/drill", "--name", "drill",
+               "--initial-cluster", "drill=" + PEER, "--initial-advertise-peer-urls", PEER,
+               "--initial-cluster-token", "drill-{{ execution.id }}"], 1800)
+      if p.returncode != 0:
+          problems.append("restore failed: " + explain_hash(short(p.stderr or p.stdout)))
+          done()
+      r["restore_seconds"] = round(time.time() - t, 2)
+
+      # 4. start it: it can never join the live cluster (new cluster ID, own token, loopback only)
+      log = open("/tmp/drill.log", "w")
+      server = subprocess.Popen(["etcd", "--name", "drill", "--data-dir", "/tmp/drill",
+                                 "--listen-client-urls", SCRATCH, "--advertise-client-urls", SCRATCH,
+                                 "--listen-peer-urls", PEER, "--initial-advertise-peer-urls", PEER,
+                                 "--initial-cluster", "drill=" + PEER, "--quota-backend-bytes", "8589934592"],
+                                stdout=log, stderr=subprocess.STDOUT)
+      # started = it elected itself leader and serves a linearizable read (endpoint health would say false
+      # when the snapshot carries an alarm, which is checked separately below)
+      t, started = time.time(), False
+      while time.time() - t < 60 and server.poll() is None and not started:
+          try:
+              ctl(["get", "--keys-only", "--limit=1", "--", "x"], SCRATCH, timeout=3, tls=False)
+              started = True
+          except EtcdError:
+              time.sleep(1)
+      r["start_seconds"] = round(time.time() - t, 2)
+      try:
+          if not started:
+              tail = open("/tmp/drill.log").read().strip().splitlines()[-3:]
+              problems.append("restored member did not start within 60 s: " + " | ".join(l[:200] for l in tail))
+              done()
+
+          carried = sorted(set(ALARMS.get(str(a.get("alarm")), str(a.get("alarm"))) for a in ctl(["alarm", "list"], SCRATCH, tls=False).get("alarms", [])))
+          if carried:
+              notes.append("the snapshot carries the %s alarm: a cluster restored from it starts refusing writes until you run etcdctl alarm disarm" % "/".join(carried))
+          # 5. compare with the live cluster (count is the size of the whole range even with --limit) at the snapshot's revision
+          restored = ctl(["get", "--prefix", "--keys-only", "--limit=1", "--", ""], SCRATCH, tls=False)
+          r["restored"] = {"keys": restored.get("count", 0), "revision": restored["header"]["revision"]}
+          if restored["header"]["revision"] != rev:
+              problems.append("restored member is at revision %s, the snapshot says %s" % (restored["header"]["revision"], rev))
+          live_ep = next((m["endpoint"] for m in members if m["up"]), source["endpoint"])
+          comparable = True
+          try:
+              live = ctl(["get", "--prefix", "--keys-only", "--limit=1", "--consistency=s", "--rev=%d" % rev, "--", ""], live_ep)
+              r["live"] = {"keys_at_snapshot_revision": live.get("count", 0), "current_revision": live["header"]["revision"]}
+              if live.get("count", 0) != r["restored"]["keys"]:
+                  problems.append("restored member has %s keys, the live cluster had %s at revision %s" % (r["restored"]["keys"], live.get("count", 0), rev))
+          except EtcdError as e:
+              comparable = False
+              notes.append("live cluster cannot be read at revision %s (%s): only the restore itself was verified" % (rev, e))
+
+          # 6. sample keys: value, create/mod revision and version must match
+          keys = [k["key"] for k in ctl(["get", "--prefix", "--keys-only", "--", ""], SCRATCH, timeout=120, tls=False).get("kvs", [])]
+          sample = random.sample(keys, min({{ inputs.sample_keys }}, len(keys)))
+          mismatches = []
+          for k in sample if comparable else []:
+              name = base64.b64decode(k).decode("utf-8", "surrogateescape")
+              a = (ctl(["get", "--", name], SCRATCH, tls=False).get("kvs") or [{}])[0]
+              b = (ctl(["get", "--consistency=s", "--rev=%d" % rev, "--", name], live_ep).get("kvs") or [{}])[0]
+              fields = ("value", "create_revision", "mod_revision", "version")
+              if [a.get(f) for f in fields] != [b.get(f) for f in fields]:
+                  diff = [f for f in fields if a.get(f) != b.get(f)]
+                  mismatches.append("%s (%s)" % (name[:80], ", ".join(diff)))
+          r["sample"] = {"checked": len(sample) if comparable else 0, "mismatches": mismatches[:10], "mismatch_count": len(mismatches)}
+          if mismatches:
+              problems.append("%d of %d sampled keys differ from the live cluster, e.g. %s" % (len(mismatches), len(sample), mismatches[0]))
+      finally:
+          server.terminate()
+          try:
+              server.wait(10)
+          except subprocess.TimeoutExpired:
+              server.kill()
+          shutil.rmtree("/tmp/drill", ignore_errors=True)
+      done()
+
+  - id: evaluate
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Compare with the state saved by the last run (KV store) and keep only what changed: members down or back,
+      quota levels, alarms raised or cleared, drill verdict. Decide whether to offer maintenance.
+    containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+    pythonVersion: "3.12"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      networkMode: none
+      pullPolicy: IF_NOT_PRESENT
+    inputFiles:
+      etcdlib.py: "{{ vars.etcdlib }}"
+      previous.json: "{{ (kv('etcd-drill-' ~ inputs.cluster_name, errorOnMissing=false) ?? {}) | toJson }}"
+      health.json: "{{ outputs.probe.vars.report | toJson }}"
+      drill.json: "{{ outputs.drill.vars.report | toJson }}"
+    script: &evaluate |
+      from etcdlib import *
+      prev = json.load(open("previous.json")) or {}
+      if isinstance(prev, str):
+          prev = json.loads(prev)
+      h = json.load(open("health.json"))
+      d = json.load(open("drill.json")) if os.path.exists("drill.json") else {}
+      first, now = not prev, int(time.time())
+      lines = []
+      # alarm list needs quorum: without it, keep the alarms last seen
+      known = sorted("%s on %s" % (a["alarm"], a["member"]) for a in h["alarms"])
+      state = {"members": {}, "levels": {}, "alarms": known if h.get("alarms_known", True) else prev.get("alarms", []),
+               "drill": d.get("verdict", prev.get("drill", "")), "asked_at": prev.get("asked_at", 0), "ask_key": prev.get("ask_key", "")}
+
+      for m in h["members"]:
+          status = "up" if m["up"] else "down"
+          state["members"][m["name"]] = status
+          old = prev.get("members", {}).get(m["name"])
+          if status == "down" and old != "down":
+              lines.append("DOWN %s (%s): %s" % (m["name"], m["endpoint"] or "no client URL", m["error"]))
+          elif status == "up" and old == "down":
+              lines.append("UP %s answers again" % m["name"])
+          if m["up"]:
+              state["levels"][m["name"]] = m["level"]
+              old_level = prev.get("levels", {}).get(m["name"], "ok")
+              if m["level"] != old_level:
+                  if m["level"] == "ok":
+                      lines.append("OK %s database back to %s%% of its quota (%s of %s)" % (m["name"], m["used_percent"], mib(m["db_size"]), mib(m["quota"])))
+                  else:
+                      lines.append("%s %s database is %s%% of its quota: %s of %s (%s). %s of it is free pages that defragmentation returns. At 100%% etcd raises NOSPACE and refuses writes."
+                                   % (m["level"].upper(), m["name"], m["used_percent"], mib(m["db_size"]), mib(m["quota"]), m["quota_source"], mib(m["free_bytes"])))
+      for name in sorted(set(prev.get("members", {})) - set(state["members"])):
+          lines.append("REMOVED %s is no longer a member" % name)
+      if not h["quorum"] and (first or prev.get("quorum", True)):
+          lines.append("QUORUM LOST: only %d of %d voting members answer. Writes fail until a majority is back." % (h["voting_up"], h["voting"]))
+      elif h["voting_up"] < h["voting"] and h["quorum"] and any(l.startswith("DOWN") for l in lines):
+          spare = h["voting_up"] - (h["voting"] // 2 + 1)
+          lines.append("The cluster runs on %d of %d members and %s. Restart the member, or replace it (member remove, then member add with a fresh data dir)."
+                       % (h["voting_up"], h["voting"], "cannot lose another one without losing quorum" if spare == 0 else "can lose %d more" % spare))
+      state["quorum"] = h["quorum"]
+
+      for a in sorted(set(state["alarms"]) - set(prev.get("alarms", []))):
+          if a.startswith("NOSPACE"):
+              lines.append("ALARM %s: the cluster only serves reads and deletes until it is disarmed. Recovery: compact, defragment every member, then disarm." % a)
+          elif a.startswith("CORRUPT"):
+              lines.append("ALARM %s: members disagree on their data. Do not defragment. Find the member that diverged (etcdctl endpoint hashkv --cluster), remove it and add it back empty, or restore the cluster from a verified snapshot." % a)
+          else:
+              lines.append("ALARM %s" % a)
+      for a in sorted(set(prev.get("alarms", [])) - set(state["alarms"])):
+          lines.append("CLEARED alarm %s" % a)
+
+      if d:
+          sn = d.get("snapshot", {})
+          if d["verdict"] == "PASS" and (first or prev.get("drill") != "PASS"):
+              lines.append("%sRestore drill PASS: %s (live member %s) at revision %s (%s, %s key revisions in the file) restored in %ss and started in %ss; its %s keys and %s sampled keys match the live cluster at that revision.%s"
+                           % ("" if first else "RECOVERED ", d["mode"], d["source"], sn.get("revision"), sn.get("size"), sn.get("total_keys"),
+                              d.get("restore_seconds"), d.get("start_seconds"), d.get("restored", {}).get("keys"), d.get("sample", {}).get("checked"),
+                              (" Note: " + "; ".join(d["notes"])) if d["notes"] else ""))
+          elif d["verdict"] == "FAIL" and (first or prev.get("drill") != "FAIL" or prev.get("drill_problem") != d["problems"][0]):
+              lines.append("Restore drill FAIL (%s, live member %s): %s. This backup would not give you the cluster back: fix it before you need it."
+                           % (d["mode"], d["source"], "; ".join(d["problems"])))
+          state["drill_problem"] = d["problems"][0] if d["problems"] else ""
+      else:
+          state["drill_problem"] = prev.get("drill_problem", "")
+
+      # maintenance offer
+      full = [m for m in h["members"] if m["up"] and m["level"] == "critical"]
+      fragmented = [m for m in h["members"] if m["up"] and m["free_percent"] >= {{ inputs.fragmentation_percent }} and m["free_bytes"] >= {{ inputs.fragmentation_min_mb }} * 1048576]
+      nospace = [a for a in state["alarms"] if a.startswith("NOSPACE")]
+      corrupt = [a for a in state["alarms"] if a.startswith("CORRUPT")]
+      ok, why = ready(h)
+      propose, proposal, blocked = False, "", ""
+      if full or fragmented or nospace:
+          if corrupt:
+              blocked = "Maintenance is not offered while a CORRUPT alarm is active."
+          elif not ok:
+              blocked = "Defragmentation is not offered while %s: blocking one more member could stall the cluster." % why
+          else:
+              ask_key = json.dumps([state["levels"], state["alarms"], sorted(m["name"] for m in fragmented)], sort_keys=True)
+              if ask_key != prev.get("ask_key") or now - prev.get("asked_at", 0) >= {{ inputs.ask_again_hours }} * 3600:
+                  propose = True
+                  state["asked_at"], state["ask_key"] = now, ask_key
+                  order = sorted((m for m in h["members"] if not m["leader"]), key=lambda m: m["name"]) + [m for m in h["members"] if m["leader"]]
+                  proposal = "\n".join(["- %s%s: %s file, %s in use, %s free (%s%% of quota)" % (m["name"], " (leader)" if m["leader"] else "",
+                                        mib(m["db_size"]), mib(m["db_in_use"]), mib(m["free_bytes"]), m["used_percent"]) for m in order])
+                  proposal += ("\nCompaction keeps only the latest version of each key up to revision %s (watchers older than that must re-list; Kubernetes compacts by itself every 5 minutes)."
+                               "\nDefragmentation goes one member at a time, followers first, the leader last, and checks the cluster between members. Each member is blocked while it defragments."
+                               % h["revision"])
+                  if nospace:
+                      proposal += "\nThe NOSPACE alarm is disarmed only if every member is then below %s%% of its quota." % {{ inputs.quota_warn_percent }}
+          if blocked and (first or prev.get("blocked") != blocked):
+              lines.append(blocked)
+      state["blocked"] = blocked
+      print("\n".join(lines) or "no change")
+      output(changes=lines, state=state, propose=propose, proposal=proposal)
+
+  - id: notify_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.vars.changes | length > 0 }}"
+    then:
+      - id: slack_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          etcd {{ inputs.cluster_name }}{% if (trigger.body.commonLabels.alertname ?? '') != '' %} (Alertmanager: {{ trigger.body.commonLabels.alertname }}){% endif %}:
+          {% for l in outputs.evaluate.vars.changes %}- {{ l }}
+          {% endfor %}{{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: Saved after the message is sent, so a failed notification is retried by the next run.
+    key: "etcd-drill-{{ inputs.cluster_name }}"
+    kvType: JSON
+    value: "{{ outputs.evaluate.vars.state | toJson }}"
+
+  - id: propose
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate.vars.propose }}"
+    then:
+      - id: ask_on_call
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          etcd {{ inputs.cluster_name }}: maintenance available (choose within 2 hours, nothing happens otherwise): {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+          {{ outputs.evaluate.vars.proposal }}
+
+      - id: wait_for_decision
+        type: io.kestra.plugin.core.flow.Pause
+        description: No answer within 2 hours means nothing is done.
+        pauseDuration: PT2H
+        behavior: RESUME
+        onResume:
+          - id: actions
+            type: MULTISELECT
+            description: Run in this order. NOSPACE recovery needs all three.
+            values:
+              - Compact history
+              - Defragment members one at a time
+              - Disarm the NOSPACE alarm
+            required: false
+
+      - id: compact
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Compact history' }}"
+        then:
+          - id: compact_history
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-checks the cluster after the approval, then compacts to the current revision.
+            containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+            pythonVersion: "3.12"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: "{{ inputs.docker_network }}"
+              pullPolicy: IF_NOT_PRESENT
+            inputFiles:
+              etcdlib.py: "{{ vars.etcdlib }}"
+            env:
+              ETCD_TLS: "{{ inputs.tls }}"
+              ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+              ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+              ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+            script: |
+              from etcdlib import *
+              h = probe("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }})
+              if not h["quorum"]:
+                  output(result="NOT compacted: the cluster has no quorum")
+                  sys.exit(0)
+              up = ",".join(m["endpoint"] for m in h["members"] if m["up"])
+              rev = ctl(["get", "--keys-only", "--", "x"], up)["header"]["revision"]
+              try:
+                  ctl(["compaction", "--physical", str(rev)], up, timeout=600, json_out=False)
+                  output(result="compacted history up to revision %d" % rev)
+              except EtcdError as e:
+                  if "compacted" in str(e):
+                      output(result="history was already compacted up to revision %d" % rev)
+                  else:
+                      output(result="NOT compacted: %s" % e)
+
+      - id: defragment
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Defragment members one at a time' }}"
+        then:
+          - id: plan_defrag
+            type: io.kestra.plugin.scripts.python.Script
+            description: The approval may come hours later and the leader may have moved, so the order is computed now.
+            containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+            pythonVersion: "3.12"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: "{{ inputs.docker_network }}"
+              pullPolicy: IF_NOT_PRESENT
+            inputFiles:
+              etcdlib.py: "{{ vars.etcdlib }}"
+            env:
+              ETCD_TLS: "{{ inputs.tls }}"
+              ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+              ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+              ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+            script: |
+              from etcdlib import *
+              h = probe("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }})
+              ok, why = ready(h)
+              order = sorted((m for m in h["members"] if not m["leader"]), key=lambda m: (not m["learner"], m["name"])) + [m for m in h["members"] if m["leader"]]
+              plan = [{"name": m["name"], "endpoint": m["endpoint"], "role": "leader" if m["leader"] else "learner" if m["learner"] else "follower"} for m in order] if ok else []
+              print("order: %s" % (" -> ".join(p["name"] for p in plan) or "none, " + why))
+              output(plan=plan, blocked="" if ok else "NOT started: " + why)
+
+          - id: defrag_members
+            type: io.kestra.plugin.core.flow.Loop
+            description: One member at a time. Every iteration first checks that the whole cluster is fine, so a member that does not come back stops the rest.
+            values: "{{ outputs.plan_defrag.vars.plan | toJson }}"
+            concurrencyLimit: 1
+            outputs:
+              - id: result
+                type: STRING
+                value: "{{ outputs.defrag_member.vars.result ?? (fromJson(item.value).name ~ ': NOT defragmented, see the execution logs') }}"
+            tasks:
+              - id: defrag_member
+                type: io.kestra.plugin.scripts.python.Script
+                containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+                pythonVersion: "3.12"
+                taskRunner:
+                  type: io.kestra.plugin.scripts.runner.docker.Docker
+                  networkMode: "{{ inputs.docker_network }}"
+                  pullPolicy: IF_NOT_PRESENT
+                timeout: PT2H
+                inputFiles:
+                  etcdlib.py: "{{ vars.etcdlib }}"
+                env:
+                  MEMBER: "{{ item.value }}"
+                  ETCD_TLS: "{{ inputs.tls }}"
+                  ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+                  ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+                  ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+                script: |
+                  from etcdlib import *
+                  target = json.loads(os.environ["MEMBER"])
+                  args = ("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }})
+                  h = probe(*args)
+                  ok, why = ready(h)
+                  if not ok:
+                      output(result="%s: NOT defragmented, skipped because %s" % (target["name"], why))
+                      sys.exit(0)
+                  before = next(m for m in h["members"] if m["name"] == target["name"])
+                  t = time.time()
+                  try:
+                      ctl(["defrag"], target["endpoint"], timeout={{ inputs.defrag_timeout_seconds }}, json_out=False)
+                  except EtcdError as e:
+                      output(result="%s: NOT defragmented: %s" % (target["name"], e))
+                      sys.exit(0)
+                  took = time.time() - t
+                  # wait until the member answers and the cluster agrees on a leader again
+                  for i in range(30):
+                      h = probe(*args)
+                      ok, why = ready(h)
+                      if ok:
+                          break
+                      time.sleep(2)
+                  after = next(m for m in h["members"] if m["name"] == target["name"])
+                  if not ok:
+                      output(result="%s: defragmented, but afterwards %s; later members are skipped" % (target["name"], why))
+                  else:
+                      output(result="%s (%s): %s -> %s in %.1fs, now %s%% of quota" % (target["name"], target["role"], mib(before["db_size"]),
+                             mib(after.get("db_size", 0)), took, after.get("used_percent")))
+
+      - id: disarm
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_for_decision.onResume.actions ?? []) contains 'Disarm the NOSPACE alarm' }}"
+        then:
+          - id: disarm_alarm
+            type: io.kestra.plugin.scripts.python.Script
+            description: Disarms only when every member is back below the warning level; otherwise the alarm would trip again at once.
+            containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+            pythonVersion: "3.12"
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+              networkMode: "{{ inputs.docker_network }}"
+              pullPolicy: IF_NOT_PRESENT
+            inputFiles:
+              etcdlib.py: "{{ vars.etcdlib }}"
+            env:
+              ETCD_TLS: "{{ inputs.tls }}"
+              ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+              ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+              ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+            script: |
+              from etcdlib import *
+              h = probe("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }})
+              nospace = [a for a in h["alarms"] if a["alarm"] == "NOSPACE"]
+              still = [m for m in h["members"] if m["up"] and m["level"] != "ok"]
+              up = ",".join(m["endpoint"] for m in h["members"] if m["up"])
+              if not nospace:
+                  output(result="no NOSPACE alarm to disarm")
+              elif still:
+                  output(result="NOSPACE NOT disarmed: %s still at %s%% of its quota and would trip it again. Compact and defragment first." % (still[0]["name"], still[0]["used_percent"]))
+              else:
+                  ctl(["alarm", "disarm"], up, json_out=False)
+                  left = [a for a in ctl(["alarm", "list"], up).get("alarms", []) if ALARMS.get(str(a.get("alarm"))) == "NOSPACE"]
+                  output(result="NOSPACE NOT disarmed: it is still listed" if left else "NOSPACE disarmed: writes are accepted again")
+
+      - id: recheck
+        type: io.kestra.plugin.scripts.python.Script
+        description: Read the cluster again after the actions.
+        containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+        pythonVersion: "3.12"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: "{{ inputs.docker_network }}"
+          pullPolicy: IF_NOT_PRESENT
+        inputFiles:
+          etcdlib.py: "{{ vars.etcdlib }}"
+        env:
+          ETCD_TLS: "{{ inputs.tls }}"
+          ETCD_CA_CERT: "{{ inputs.tls ? secret('ETCD_CA_CERT') : '' }}"
+          ETCD_CLIENT_CERT: "{{ inputs.tls ? secret('ETCD_CLIENT_CERT') : '' }}"
+          ETCD_CLIENT_KEY: "{{ inputs.tls ? secret('ETCD_CLIENT_KEY') : '' }}"
+        script: |
+          from etcdlib import *
+          output(report=probe("{{ inputs.endpoints }}", {{ inputs.default_quota_mb }} * 1048576, {{ inputs.quota_warn_percent }}, {{ inputs.quota_critical_percent }}))
+
+      - id: settle
+        type: io.kestra.plugin.scripts.python.Script
+        description: Same comparison as evaluate, against the state saved before the pause, so the next run does not repeat what the outcome message already says.
+        containerImage: "kestra-etcd-tools:{{ inputs.etcd_version }}"
+        pythonVersion: "3.12"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          networkMode: none
+          pullPolicy: IF_NOT_PRESENT
+        inputFiles:
+          etcdlib.py: "{{ vars.etcdlib }}"
+          previous.json: "{{ outputs.evaluate.vars.state | toJson }}"
+          health.json: "{{ outputs.recheck.vars.report | toJson }}"
+        script: *evaluate
+
+      - id: save_settled
+        type: io.kestra.plugin.core.kv.Set
+        key: "etcd-drill-{{ inputs.cluster_name }}"
+        kvType: JSON
+        value: "{{ outputs.settle.vars.state | toJson }}"
+
+      - id: notify_outcome
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {% if (outputs.wait_for_decision.onResume.actions ?? []) | length == 0 %}etcd {{ inputs.cluster_name }}: no maintenance chosen; nothing was changed. Offered again in {{ inputs.ask_again_hours }} hours if still needed.{% else %}etcd {{ inputs.cluster_name }} maintenance: {{ outputs.wait_for_decision.onResume.actions | join(', ') }}
+          {% if outputs.compact_history is defined %}- {{ outputs.compact_history.vars.result }}
+          {% endif %}{% if (outputs.plan_defrag.vars.blocked ?? '') != '' %}- Defragmentation {{ outputs.plan_defrag.vars.blocked }}
+          {% endif %}{% for r in outputs.defrag_members.outputs ?? [] %}- {{ r.outputs.result }}
+          {% endfor %}{% if outputs.disarm_alarm is defined %}- {{ outputs.disarm_alarm.vars.result }}
+          {% endif %}{% for l in outputs.settle.vars.changes %}- {{ l }}
+          {% endfor %}Now: {% for m in outputs.recheck.vars.report.members %}{{ m.name }} {% if m.up %}{{ m.used_percent }}% of quota{% else %}DOWN{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}; alarms: {% if outputs.recheck.vars.report.alarms | length == 0 %}none{% else %}{% for a in outputs.recheck.vars.report.alarms %}{{ a.alarm }} on {{ a.member }} {% endfor %}{% endif %}{% endif %}
+
+  - id: verdict
+    type: io.kestra.plugin.core.flow.If
+    description: End the run WARNING when the drill failed, a member is down, an alarm is active or a maintenance step did not complete, so it stands out in the execution list.
+    condition: >-
+      {{ outputs.drill.vars.report.verdict == 'FAIL'
+      or (outputs.recheck.vars.report ?? outputs.probe.vars.report).voting_up < outputs.probe.vars.report.voting
+      or (outputs.recheck.vars.report ?? outputs.probe.vars.report).alarms | length > 0
+      or ({'d': outputs.defrag_members.outputs ?? [], 'c': outputs.compact_history.vars.result ?? '', 'a': outputs.disarm_alarm.vars.result ?? '', 'b': outputs.plan_defrag.vars.blocked ?? ''}
+          | jq('[(.d[] | .outputs.result), .c, .a, .b | select(contains("NOT "))] | length') | first > 0) }}
+    then:
+      - id: needs_attention
+        type: io.kestra.plugin.core.execution.Fail
+        description: allowFailure turns this into a WARNING that keeps the flow outputs (an Exit would drop them) and does not trigger errors.
+        allowFailure: true
+        errorMessage: "Needs attention: see the Slack message and the drill and members outputs"
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      etcd {{ inputs.cluster_name }} drill failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: drill
+    type: JSON
+    description: Verdict, snapshot revision, hash, size, restore and start times, key counts and sample comparison.
+    value: "{{ outputs.drill.vars.report ?? {} }}"
+  - id: members
+    type: JSON
+    description: Each member with its health, role, revision, database size, free pages and quota usage (after maintenance, if any ran).
+    value: "{{ (outputs.recheck.vars.report ?? outputs.probe.vars.report).members ?? [] }}"

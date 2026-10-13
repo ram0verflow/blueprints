@@ -1,0 +1,43 @@
+=== matrix 2026-10-13T01:48:23Z on 2.0.5
+[PASS] T1 first run, healthy cluster: state=SUCCESS (want SUCCESS) exec=VvhnJC1CWH9s0sPtAwlzn
+      | etcd main:
+      | - Restore drill PASS: new snapshot (live member etcd2) at revision 601 (0.4 MiB, 608 key revisions in the file) restored in 0.07s and started in 2.51s; its 500 keys and 50 sampled keys match the live cluster at that revision.
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/VvhnJC1CWH9s0sPtAwlzn
+      | 
+[PASS] T2 nothing changed: state=SUCCESS (want SUCCESS) exec=4MTkrZ1fMRCOnyb3BfLn7s
+[PASS] T3 400 keys rewritten during the drill: state=SUCCESS (want SUCCESS) exec=4PvStOHrdENzBITr0LVEk7
+[PASS] T4 uploaded backup with 64 flipped bytes: state=WARNING (want WARNING) exec=6SeinNaWdCMdPap2UmkN70
+      | etcd main:
+      | - Restore drill FAIL (uploaded file, live member etcd2): the file is corrupt (bbolt check: freepages: failed to get all reachable pages (key[6]=(hex)fffffffffffffb34a0ffffffffffffffff on leaf page(166) needs to be < than key of the next element in anc); its SHA-256 does not match the one etcdctl snapshot save appended: the file changed after it was written. This backup would not give you the cluster back: fix it before you need it.
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/6SeinNaWdCMdPap2UmkN70
+      | 
+[PASS] T5 uploaded backup cut to a third: state=WARNING (want WARNING) exec=2Wrtd2kE0rm6bqDkr4Hc7n
+      | etcd main:
+      | - Restore drill FAIL (uploaded file, live member etcd2): the file is corrupt (bbolt check: assertion failed: Page expected to be: 326, but self identifies as 0); it has no SHA-256 trailer: the file is truncated, or it is a raw copy of member/snap/db instead of etcdctl snapshot save output. This backup would not give you the cluster back: fix it before you need it.
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/2Wrtd2kE0rm6bqDkr4Hc7n
+      | 
+[PASS] T6 good uploaded backup, older than the live data: state=SUCCESS (want SUCCESS) exec=4cOnxYKbTw73W9p786tkIX
+      | etcd main:
+      | - RECOVERED Restore drill PASS: uploaded file (live member etcd2) at revision 3001 (1.3 MiB, 3008 key revisions in the file) restored in 0.04s and started in 1.03s; its 500 keys and 50 sampled keys match the live cluster at that revision.
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/4cOnxYKbTw73W9p786tkIX
+      | 
+leader: etcd1
+[PASS] T7 leader etcd1 stopped, run started by the Alertmanager webhook: state=WARNING (want WARNING) exec=3AX5FzIbx8ILwYHywgMEl7
+      | etcd main (Alertmanager: etcdMembersDown):
+      | - DOWN etcd1 (http://127.0.0.1:2379): Failed to get the status of endpoint http://127.0.0.1:2379 (context deadline exceeded)
+      | - The cluster runs on 2 of 3 members and cannot lose another one without losing quorum. Restart the member, or replace it (member remove, then member add with a fresh data dir).
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/3AX5FzIbx8ILwYHywgMEl7
+      | 
+[PASS] T8 still down: no repeat: state=WARNING (want WARNING) exec=6z8PymQUYfGZG8kSgn2Z6W
+[PASS] T9 member back: state=SUCCESS (want SUCCESS) exec=xoa0RzAhORZWxb3qIdYf2
+      | etcd main:
+      | - UP etcd1 answers again
+      | http://localhost:8080/ui/main/executions/company.team/etcd-snapshot-restore-drill/xoa0RzAhORZWxb3qIdYf2
+      | 
++------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+|        ENDPOINT        |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |
++------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
+|  http://127.0.0.1:2379 | 93eee4059f144d57 |  3.5.17 |   28 MB |     false |      false |         3 |       3142 |               3142 |        |
+| http://127.0.0.1:22379 | 6515f44b2e72e4a7 |  3.5.17 |   28 MB |      true |      false |         3 |       3142 |               3142 |        |
+| http://127.0.0.1:32379 |  535af52a14f569f |  3.5.17 |   30 MB |     false |      false |         3 |       3142 |               3142 |        |
++------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+
