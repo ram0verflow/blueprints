@@ -1,0 +1,740 @@
+id: mongodb-index-drift-reconciler
+namespace: company.team
+description: |
+  Keeps the indexes of a MongoDB database equal to a reviewed list, after each deploy and once a day.
+  Missing indexes are created. Changed definitions and extra indexes that are still read are reported, never touched.
+  An extra index nobody has read since the last restart is hidden only after on-call approves. It is dropped only on a later run, after a second approval, once it has stayed hidden for the configured number of days.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: after_deploy
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: mongodb-index-drift-change-me
+    description: Call it from the deploy job after a release that changes indexes. `curl -X POST "http://localhost:8080/api/v1/executions/webhook/company.team/mongodb-index-drift-reconciler/mongodb-index-drift-change-me"`. It runs against the spec stored in the flow's inputs.
+  - id: daily_sweep
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 6 * * *"
+    disabled: true
+    description: Backstop for drift no deploy caused, such as an index created or dropped by hand. Disabled, so it does not run until the flow points at a real database.
+
+inputs:
+  - id: desired_indexes
+    type: STRING
+    displayName: Desired indexes (YAML)
+    description: The indexes each collection must have, as a YAML mapping of collection name to a list of indexes. Change it when a release adds or removes an index, and keep it in review with the code that depends on it.
+    defaults: |
+      orders:
+        - name: orders_customer_created
+          keys: {customer_id: 1, created_at: -1}
+        - name: orders_number_unique
+          keys: {order_number: 1}
+          unique: true
+        - name: orders_open_status
+          keys: {status: 1}
+          partialFilterExpression: {status: open}
+      sessions:
+        - name: sessions_expire_ttl
+          keys: {expires_at: 1}
+          expireAfterSeconds: 0
+  - id: database
+    type: STRING
+    displayName: Database
+    description: The database that holds the collections in the spec. The connection in the MONGODB_URI secret is used for it; the database name here picks which one.
+    defaults: shop
+  - id: hide_after_days
+    type: FLOAT
+    displayName: Days hidden before a drop is proposed
+    description: How long an index must stay hidden, with no COLLSCAN on its collection since then, before a later run proposes dropping it. Use a fraction in tests (0.0001 is about 9 seconds).
+    defaults: 14.0
+  - id: kestra_url
+    type: STRING
+    displayName: Kestra URL
+    description: Base URL of this Kestra, used for the execution link in Slack messages.
+    defaults: http://localhost:8080
+
+variables:
+  reconcile: |
+    import json, os, sys, yaml
+    from datetime import datetime, timezone
+    from pymongo import MongoClient, IndexModel
+    from pymongo.errors import OperationFailure, PyMongoError
+    from kestra import Kestra
+
+    MODE = os.environ["MODE"]
+    DB_NAME = os.environ["DATABASE"]
+    DAYS = float(os.environ["HIDE_AFTER_DAYS"])
+    NOW = datetime.now(timezone.utc)
+    ISO = "%Y-%m-%dT%H:%M:%SZ"
+    db = MongoClient(os.environ["MONGODB_URI"], serverSelectionTimeoutMS=5000)[DB_NAME]
+
+
+    def iso(dt):
+        return dt.strftime(ISO)
+
+
+    def parse(text):
+        return datetime.strptime(text, ISO).replace(tzinfo=timezone.utc)
+
+
+    def norm(value):
+        # numbers compare as floats, so 1 and 1.0 are the same index
+        if value is None or isinstance(value, (bool, str)):
+            return value
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, dict):
+            return {str(k): norm(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [norm(v) for v in value]
+        return str(value)
+
+
+    def wanted(ix):
+        return {"keys": [[k, norm(d)] for k, d in ix["keys"].items()],
+                "unique": bool(ix.get("unique", False)),
+                "partialFilterExpression": norm(ix.get("partialFilterExpression")),
+                "expireAfterSeconds": norm(ix.get("expireAfterSeconds"))}
+
+
+    def live(info):
+        return {"keys": [[k, norm(d)] for k, d in info["key"].items()],
+                "unique": bool(info.get("unique", False)),
+                "partialFilterExpression": norm(info.get("partialFilterExpression")),
+                "expireAfterSeconds": norm(info.get("expireAfterSeconds"))}
+
+
+    def fingerprint(definition):
+        return json.dumps(definition, sort_keys=True)
+
+
+    def whole(v):
+        return int(v) if isinstance(v, float) and v.is_integer() else v
+
+
+    def describe(d):
+        parts = ["keys " + ", ".join(f"{k}:{whole(v)}" for k, v in d["keys"]), "unique" if d["unique"] else "non-unique"]
+        if d["partialFilterExpression"] is not None:
+            parts.append("partial " + json.dumps(d["partialFilterExpression"], sort_keys=True))
+        if d["expireAfterSeconds"] is not None:
+            parts.append(f"TTL {whole(d['expireAfterSeconds'])}s")
+        return ", ".join(parts)
+
+
+    def live_indexes(coll):
+        batch = db.command({"listIndexes": coll})["cursor"]["firstBatch"]
+        return {i["name"]: i for i in batch}
+
+
+    def usage(coll):
+        # ops and since come from $indexStats; since restarts with the server
+        return {s["name"]: s["accesses"] for s in db[coll].aggregate([{"$indexStats": {}}])}
+
+
+    def model(ix):
+        extra = {}
+        if ix.get("unique"):
+            extra["unique"] = True
+        if ix.get("partialFilterExpression") is not None:
+            extra["partialFilterExpression"] = ix["partialFilterExpression"]
+        if ix.get("expireAfterSeconds") is not None:
+            extra["expireAfterSeconds"] = ix["expireAfterSeconds"]
+        return IndexModel(list(ix["keys"].items()), name=ix["name"], **extra)
+
+
+    def clear_failures(state, key):
+        for mark in [m for m in state["reported"] if m.startswith(key + ":failed:")]:
+            del state["reported"][mark]
+
+
+    def load_state():
+        state = json.load(open("state.json")) or {}
+        state.setdefault("hidden", {})
+        state.setdefault("reported", {})
+        return state
+
+
+    def regressions(coll, since):
+        # None means no query data could be read: the profiler is off, or this user may not read it
+        try:
+            if db.command({"profile": -1})["was"] == 0:
+                return None
+            return db["system.profile"].count_documents({"ns": f"{DB_NAME}.{coll}", "ts": {"$gte": since}, "planSummary": {"$regex": "^COLLSCAN"}})
+        except OperationFailure:
+            return None
+
+
+    def validate():
+        try:
+            spec = yaml.safe_load(open("spec.yaml"))
+        except yaml.YAMLError as error:
+            return {"ok": False, "problems": ["the YAML does not parse: " + str(error).splitlines()[0]]}
+        if not isinstance(spec, dict) or not spec:
+            return {"ok": False, "problems": ["expected a mapping of collection name to a list of indexes"]}
+        problems = []
+        existing = set(db.list_collection_names())
+        for coll, items in spec.items():
+            if coll not in existing:
+                problems.append(f"collection {coll} does not exist in {DB_NAME}")
+            if not isinstance(items, list) or not items:
+                problems.append(f"{coll}: list at least one index")
+                continue
+            names = set()
+            for ix in items:
+                name = ix.get("name") if isinstance(ix, dict) else None
+                if not isinstance(name, str) or not name:
+                    problems.append(f"{coll}: every index needs a name")
+                    continue
+                label = f"{coll}.{name}"
+                if name == "_id_" or name in names:
+                    problems.append(f"{label}: the name must be unique and not _id_")
+                names.add(name)
+                keys = ix.get("keys")
+                if not isinstance(keys, dict) or not keys:
+                    problems.append(f"{label}: keys must be a non-empty mapping")
+                elif "expireAfterSeconds" in ix and len(keys) != 1:
+                    problems.append(f"{label}: a TTL index needs exactly one key")
+        return {"ok": not problems, "problems": problems}
+
+
+    def audit():
+        spec = yaml.safe_load(open("spec.yaml"))
+        state = load_state()
+        create, hide, drop, report = [], [], [], []
+        hide_lines, drop_lines = [], []
+        for coll, items in spec.items():
+            infos = live_indexes(coll)
+            use = usage(coll)
+            names = {ix["name"] for ix in items}
+            for ix in items:
+                name = ix["name"]
+                key = f"{DB_NAME}.{coll}.{name}"
+                info = infos.get(name)
+                if info is None:
+                    create.append({"kind": "create", "collection": coll, "name": name, "definition": ix})
+                elif live(info) != wanted(ix) or info.get("hidden"):
+                    mark = f"{key}:changed:" + fingerprint([wanted(ix), live(info), bool(info.get("hidden"))])
+                    if mark not in state["reported"]:
+                        note = " (hidden)" if info.get("hidden") else ""
+                        report.append(f"Changed, not touched: `{key}` is {describe(live(info))}{note}, the spec says {describe(wanted(ix))}. Drop and recreate it by hand when that is safe.")
+                        state["reported"][mark] = iso(NOW)
+            for name, info in infos.items():
+                if name == "_id_" or name in names:
+                    continue
+                key = f"{DB_NAME}.{coll}.{name}"
+                stats = use.get(name, {"ops": 0, "since": None})
+                tracked = state["hidden"].get(key)
+                if info.get("hidden") and tracked is None:
+                    mark = f"{key}:hidden-untracked"
+                    if mark not in state["reported"]:
+                        report.append(f"Hidden by someone else: `{key}` is hidden but this flow did not hide it, so its drop is not tracked. Decide by hand.")
+                        state["reported"][mark] = iso(NOW)
+                elif info.get("hidden"):
+                    hidden_since = parse(tracked["hidden_since"])
+                    if (NOW - hidden_since).total_seconds() < DAYS * 86400:
+                        continue
+                    regs = regressions(coll, hidden_since.replace(tzinfo=None))
+                    if regs:
+                        mark = f"{key}:drop-blocked"
+                        if mark not in state["reported"]:
+                            report.append(f"Drop blocked: `{key}` has {regs} COLLSCAN queries on {coll} since it was hidden. Look at the profiler before anything else.")
+                            state["reported"][mark] = iso(NOW)
+                    elif f"{key}:drop" not in state["reported"]:
+                        profiled = "" if regs is not None else " (no query data was checked: the profiler is off or cannot be read)"
+                        drop.append({"kind": "drop", "collection": coll, "name": name, "fingerprint": fingerprint(live(info))})
+                        drop_lines.append(f"`{key}`, hidden since {tracked['hidden_since']}{profiled}")
+                        state["reported"][f"{key}:drop"] = iso(NOW)
+                elif stats["ops"] == 0:
+                    if f"{key}:hide" not in state["reported"]:
+                        hide.append({"kind": "hide", "collection": coll, "name": name, "fingerprint": fingerprint(live(info))})
+                        hide_lines.append(f"`{key}` ({describe(live(info))})")
+                        state["reported"][f"{key}:hide"] = iso(NOW)
+                else:
+                    mark = f"{key}:extra-in-use"
+                    if mark not in state["reported"]:
+                        report.append(f"Extra, still read: `{key}` is not in the spec and was read {stats['ops']} times since {iso(stats['since'].replace(tzinfo=timezone.utc))}. Left alone: add it to the spec or drop it by hand.")
+                        state["reported"][mark] = iso(NOW)
+        hide_message = ""
+        if hide_lines:
+            hide_message = f"Approve hiding {len(hide_lines)} unused index(es) on {DB_NAME}: " + "; ".join(hide_lines) + ". Nothing is dropped. Hidden indexes are still maintained, and the planner stops using them. Hidden ones are dropped only on a later run, after a second approval."
+        drop_message = ""
+        if drop_lines:
+            drop_message = f"Approve dropping {len(drop_lines)} index(es) on {DB_NAME}: " + "; ".join(drop_lines) + f". Each has been hidden for {DAYS:g} days or more. The drop re-checks the definition, the days and COLLSCAN queries before it runs."
+        report_message = ""
+        if report:
+            report_message = f"Index drift on {DB_NAME}:\n- " + "\n- ".join(report)
+        Kestra.outputs({
+            "create": create,
+            "hide": hide,
+            "drop": drop,
+            "report_message": report_message,
+            "hide_message": hide_message,
+            "drop_message": drop_message,
+            "state": state,
+            "summary": {"missing": len(create), "changed_or_extra_reported": len(report), "hide_proposed": len(hide), "drop_proposed": len(drop)},
+        })
+
+
+    def act():
+        a = json.load(open("action.json"))
+        state = load_state()
+        coll, name = a["collection"], a["name"]
+        key = f"{DB_NAME}.{coll}.{name}"
+        result, message = "skipped: unknown action", ""
+        try:
+            info = live_indexes(coll).get(name)
+            if a["kind"] == "create":
+                if info is not None:
+                    result = "skipped: the index already exists"
+                else:
+                    db[coll].create_indexes([model(a["definition"])])
+                    result = "created"
+                    clear_failures(state, key)
+                    message = f":white_check_mark: Created `{key}` ({describe(wanted(a['definition']))}). Built as an online index build."
+            elif a["kind"] == "hide":
+                if info is None:
+                    result = "skipped: the index no longer exists"
+                elif info.get("hidden"):
+                    result = "skipped: it is already hidden"
+                elif usage(coll).get(name, {"ops": 0})["ops"] != 0:
+                    result = "skipped: it was read after the proposal, so it stays visible"
+                elif fingerprint(live(info)) != a["fingerprint"]:
+                    result = "skipped: its definition changed after the proposal"
+                else:
+                    db.command({"collMod": coll, "index": {"name": name, "hidden": True}})
+                    if live_indexes(coll).get(name, {}).get("hidden"):
+                        state["hidden"][key] = {"hidden_since": iso(NOW), "fingerprint": a["fingerprint"]}
+                        result = "hidden"
+                        message = f":see_no_evil: Hid unused index `{key}`. It is hidden, not dropped. A drop proposal comes on a later run, after {DAYS:g} days hidden with no regression."
+                    else:
+                        result = "failed: MongoDB did not report the index as hidden"
+            elif a["kind"] == "drop":
+                tracked = state["hidden"].get(key)
+                if info is None:
+                    result = "skipped: the index no longer exists"
+                elif not info.get("hidden"):
+                    result = "skipped: it is no longer hidden"
+                elif tracked is None:
+                    result = "skipped: this flow did not hide it"
+                elif fingerprint(live(info)) != tracked["fingerprint"]:
+                    result = "skipped: its definition changed since it was hidden"
+                elif (NOW - parse(tracked["hidden_since"])).total_seconds() < DAYS * 86400:
+                    result = f"skipped: it has been hidden for less than {DAYS:g} days"
+                else:
+                    regs = regressions(coll, parse(tracked["hidden_since"]).replace(tzinfo=None))
+                    if regs:
+                        result = f"skipped: {regs} COLLSCAN queries on {coll} since it was hidden"
+                    else:
+                        db[coll].drop_index(name)
+                        state["hidden"].pop(key, None)
+                        result = "dropped"
+                        checked = "with no COLLSCAN queries" if regs is not None else "with no query data checked, as the profiler is off or cannot be read"
+                        message = f":wastebasket: Dropped `{key}`, hidden since {tracked['hidden_since']}, {checked}."
+        except OperationFailure as error:
+            result = f"failed: {error}"
+            mark = f"{key}:failed:{error.code}"
+            if mark not in state["reported"]:
+                state["reported"][mark] = iso(NOW)
+                message = f":x: `{key}`: {a['kind']} failed. {(error.details or {}).get('errmsg', error)}"
+        if result.startswith("skipped") and a["kind"] != "create":
+            message = f":warning: Skipped `{key}`: {result[len('skipped: '):]}."
+        Kestra.outputs({"result": result, "message": message, "state": state})
+
+
+    try:
+        if MODE == "validate":
+            Kestra.outputs(validate())
+        elif MODE == "audit":
+            audit()
+        else:
+            act()
+    except PyMongoError as error:
+        print("MongoDB could not be reached or refused the request: " + str(error).splitlines()[0][:300], file=sys.stderr)
+        sys.exit(1)
+
+
+tasks:
+  - id: validate
+    type: io.kestra.plugin.scripts.python.Script
+    description: Parses the spec and checks that every collection exists. The task fails only when MongoDB cannot be reached, so retries cover connection problems and never a bad spec. A bad spec is caught by the next task.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - uv pip install --python python3.12 -q pymongo pyyaml kestra
+    env:
+      MODE: validate
+      DATABASE: "{{ inputs.database }}"
+      HIDE_AFTER_DAYS: "{{ inputs.hide_after_days }}"
+      MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+    inputFiles:
+      spec.yaml: "{{ inputs.desired_indexes }}"
+      state.json: "{{ (kv('index_drift_state', errorOnMissing=false) ?? {}) | toJson }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+    script: "{{ vars.reconcile }}"
+
+  - id: spec_rejected
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.validate.vars.ok == false }}"
+    then:
+      - id: reject_spec
+        type: io.kestra.plugin.core.execution.Fail
+        description: Stops before anything is changed. The alert names the problems.
+        errorMessage: "Desired index spec rejected, nothing changed: {{ outputs.validate.vars.problems | join('; ') }}"
+
+  - id: audit
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reads the indexes and $indexStats of each collection, compares them with the spec, and decides what to create, hide, drop or report. It changes nothing.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    beforeCommands:
+      - uv pip install --python python3.12 -q pymongo pyyaml kestra
+    env:
+      MODE: audit
+      DATABASE: "{{ inputs.database }}"
+      HIDE_AFTER_DAYS: "{{ inputs.hide_after_days }}"
+      MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+    inputFiles:
+      spec.yaml: "{{ inputs.desired_indexes }}"
+      state.json: "{{ (kv('index_drift_state', errorOnMissing=false) ?? {}) | toJson }}"
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+    script: "{{ vars.reconcile }}"
+
+  - id: save_reported
+    type: io.kestra.plugin.core.kv.Set
+    description: Stores the messages already sent, so each change is reported once.
+    key: index_drift_state
+    kvType: JSON
+    value: "{{ outputs.audit.vars.state | toJson }}"
+
+  - id: create_missing
+    type: io.kestra.plugin.core.flow.Loop
+    description: One createIndexes per missing index. Each index runs in its own Sequential with allowFailure, so a unique index that cannot build (duplicate values) is reported and the others still get built.
+    values: "{{ outputs.audit.vars.create | toJson }}"
+    outputs:
+      - id: result
+        type: STRING
+        value: >-
+          {% if outputs.act_create.vars.result is defined %}{{ outputs.act_create.vars.result }}{% else %}failed: the task raised an error, see the execution logs{% endif %}
+    tasks:
+      - id: create_one
+        type: io.kestra.plugin.core.flow.Sequential
+        allowFailure: true
+        errors:
+          - id: create_failed
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: "An index create step failed in execution {{ execution.id }} with an error the flow did not expect. See the execution logs. The other indexes are still processed."
+        tasks:
+          - id: act_create
+            type: io.kestra.plugin.scripts.python.Script
+            description: Re-checks that the index is still missing, then builds it.
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            beforeCommands:
+              - uv pip install --python python3.12 -q pymongo pyyaml kestra
+            env:
+              MODE: act
+              DATABASE: "{{ inputs.database }}"
+              HIDE_AFTER_DAYS: "{{ inputs.hide_after_days }}"
+              MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+            inputFiles:
+              action.json: "{{ item.value }}"
+              state.json: "{{ (kv('index_drift_state', errorOnMissing=false) ?? {}) | toJson }}"
+            retry:
+              type: exponential
+              interval: PT2S
+              maxInterval: PT30S
+              maxAttempts: 3
+            script: "{{ vars.reconcile }}"
+          - id: save_create
+            type: io.kestra.plugin.core.kv.Set
+            key: index_drift_state
+            kvType: JSON
+            value: "{{ outputs.act_create.vars.state | toJson }}"
+          - id: notify_create
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ (outputs.act_create.vars.message ?? '') != '' }}"
+            then:
+              - id: slack_create
+                type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                messageText: "{{ outputs.act_create.vars.message }}"
+
+  - id: report_changes
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (outputs.audit.vars.report_message ?? '') != '' }}"
+    then:
+      - id: slack_report
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: One message for the changes that need a person and were not reported before.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "{{ outputs.audit.vars.report_message }}"
+
+  - id: hide_proposal
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.vars.hide | length > 0 }}"
+    then:
+      - id: slack_hide_proposal
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {{ outputs.audit.vars.hide_message }}
+          Approve in Kestra: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+      - id: wait_hide
+        type: io.kestra.plugin.core.flow.Pause
+        description: Approval to hide the unused indexes. No answer within 24 hours means nothing is hidden.
+        pauseDuration: PT24H
+        behavior: RESUME
+        onResume:
+          - id: approve
+            type: BOOL
+            defaults: false
+            required: true
+      - id: hide_if_approved
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_hide.onResume.approve ?? false) == true }}"
+        then:
+          - id: hide_loop
+            type: io.kestra.plugin.core.flow.Loop
+            description: One collMod per unused index. Each is re-checked first, so an index that was dropped or read while the approval waited is skipped with a message.
+            values: "{{ outputs.audit.vars.hide | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {% if outputs.act_hide.vars.result is defined %}{{ outputs.act_hide.vars.result }}{% else %}failed: the task raised an error, see the execution logs{% endif %}
+            tasks:
+              - id: hide_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                errors:
+                  - id: hide_failed
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    messageText: "Hiding an unused index failed in execution {{ execution.id }} with an error the flow did not expect. See the execution logs. The other indexes are still processed."
+                tasks:
+                  - id: act_hide
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Re-checks that the index exists, is still unread and is unchanged, then hides it with collMod.
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    beforeCommands:
+                      - uv pip install --python python3.12 -q pymongo pyyaml kestra
+                    env:
+                      MODE: act
+                      DATABASE: "{{ inputs.database }}"
+                      HIDE_AFTER_DAYS: "{{ inputs.hide_after_days }}"
+                      MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+                    inputFiles:
+                      action.json: "{{ item.value }}"
+                      state.json: "{{ (kv('index_drift_state', errorOnMissing=false) ?? {}) | toJson }}"
+                    retry:
+                      type: exponential
+                      interval: PT2S
+                      maxInterval: PT30S
+                      maxAttempts: 3
+                    script: "{{ vars.reconcile }}"
+                  - id: save_hide
+                    type: io.kestra.plugin.core.kv.Set
+                    key: index_drift_state
+                    kvType: JSON
+                    value: "{{ outputs.act_hide.vars.state | toJson }}"
+                  - id: notify_hide
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ (outputs.act_hide.vars.message ?? '') != '' }}"
+                    then:
+                      - id: slack_hide
+                        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                        messageText: "{{ outputs.act_hide.vars.message }}"
+
+  - id: drop_proposal
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit.vars.drop | length > 0 }}"
+    then:
+      - id: slack_drop_proposal
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: |
+          {{ outputs.audit.vars.drop_message }}
+          Approve in Kestra: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+      - id: wait_drop
+        type: io.kestra.plugin.core.flow.Pause
+        description: Second approval, for the drop. No answer within 24 hours means nothing is dropped.
+        pauseDuration: PT24H
+        behavior: RESUME
+        onResume:
+          - id: approve
+            type: BOOL
+            defaults: false
+            required: true
+      - id: drop_if_approved
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (outputs.wait_drop.onResume.approve ?? false) == true }}"
+        then:
+          - id: drop_loop
+            type: io.kestra.plugin.core.flow.Loop
+            description: One dropIndexes per index, each re-checked first (definition, days hidden, COLLSCAN since hiding).
+            values: "{{ outputs.audit.vars.drop | toJson }}"
+            outputs:
+              - id: result
+                type: STRING
+                value: >-
+                  {% if outputs.act_drop.vars.result is defined %}{{ outputs.act_drop.vars.result }}{% else %}failed: the task raised an error, see the execution logs{% endif %}
+            tasks:
+              - id: drop_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                errors:
+                  - id: drop_failed
+                    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                    messageText: "Dropping a hidden index failed in execution {{ execution.id }} with an error the flow did not expect. See the execution logs. The other indexes are still processed."
+                tasks:
+                  - id: act_drop
+                    type: io.kestra.plugin.scripts.python.Script
+                    description: Re-checks the index, then drops it only if it is still hidden by this flow, unchanged, hidden long enough and has no COLLSCAN since.
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    beforeCommands:
+                      - uv pip install --python python3.12 -q pymongo pyyaml kestra
+                    env:
+                      MODE: act
+                      DATABASE: "{{ inputs.database }}"
+                      HIDE_AFTER_DAYS: "{{ inputs.hide_after_days }}"
+                      MONGODB_URI: "{{ secret('MONGODB_URI') }}"
+                    inputFiles:
+                      action.json: "{{ item.value }}"
+                      state.json: "{{ (kv('index_drift_state', errorOnMissing=false) ?? {}) | toJson }}"
+                    retry:
+                      type: exponential
+                      interval: PT2S
+                      maxInterval: PT30S
+                      maxAttempts: 3
+                    script: "{{ vars.reconcile }}"
+                  - id: save_drop
+                    type: io.kestra.plugin.core.kv.Set
+                    key: index_drift_state
+                    kvType: JSON
+                    value: "{{ outputs.act_drop.vars.state | toJson }}"
+                  - id: notify_drop
+                    type: io.kestra.plugin.core.flow.If
+                    condition: "{{ (outputs.act_drop.vars.message ?? '') != '' }}"
+                    then:
+                      - id: slack_drop
+                        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+                        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+                        messageText: "{{ outputs.act_drop.vars.message }}"
+
+  - id: any_failed
+    type: io.kestra.plugin.core.flow.If
+    description: Ends the run WARNING when one index failed, so the run list shows it without treating the rest as failed.
+    condition: "{{ {'c': outputs.create_missing.outputs ?? [], 'h': outputs.hide_loop.outputs ?? [], 'd': outputs.drop_loop.outputs ?? []} | jq('[.c[], .h[], .d[] | .outputs.result | select(startswith(\"failed\"))] | length') | first > 0 }}"
+    then:
+      - id: partial
+        type: io.kestra.plugin.core.execution.Exit
+        state: WARNING
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      MongoDB index drift reconciler failed in execution {{ execution.id }}
+      {% if errorLogs() | length > 0 %}at `{{ errorLogs()[0]['taskId'] }}`: {{ errorLogs()[0]['message'] | split(' \[\[') | first }}{% else %}without an error message{% endif %}.
+      {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+
+outputs:
+  - id: summary
+    type: JSON
+    description: What the audit found on this run (counts of missing, reported, hide and drop proposals). Empty on a FAILED run.
+    value: "{{ outputs.audit.vars.summary ?? {} }}"
+
+extend:
+  title: Keep MongoDB Indexes Equal to a Reviewed Spec, With Approval Before Any Removal
+  shortDescription: Compare the indexes of each collection with a reviewed YAML spec after every deploy and once a day. Create the missing ones, report changed ones, and hide then drop unused extras only after approval.
+  metaTitle: MongoDB Index Drift Reconciler with Kestra
+  metaDescription: Detect missing, changed and unused MongoDB indexes, create the missing ones, and hide then drop extras only after two approvals.
+  description: |
+    Indexes drift. A hotfix adds one in production and nobody adds it to the migrations. A release removes a field and leaves its index behind. A unique index is rebuilt without `unique` and quietly stops enforcing anything. The index list is then wrong, and nobody notices until a query slows down or a constraint stops holding.
+
+    This blueprint keeps the indexes of each collection equal to a reviewed YAML spec. It runs after each deploy, through a webhook, and once a day on a schedule. It creates what is missing and reports what has changed. An extra index that nobody reads is removed in two steps, each with an approval: first it is hidden, then it is dropped on a later run, once it has stayed hidden for a set number of days. A hidden index is kept and maintained, but the query planner ignores it, so the first step is easy to undo. The default spec is an example for a `shop` database. It runs against any MongoDB 4.4+ replica set, and single-node replica sets work for testing.
+
+    ## How it works
+    1. `validate` (`Python`) parses the spec and checks that every collection exists. It fails only when MongoDB cannot be reached, so retries never repeat a bad spec.
+    2. `spec_rejected` (`If`) stops the run with the list of problems. Nothing is changed.
+    3. `audit` (`Python`) reads `listIndexes` and `$indexStats` for each collection and sorts every index into missing, changed, unused extra, extra still in use, or hidden and due for a drop. It changes nothing.
+    4. `save_reported` (`kv.Set`) stores which changes were already reported, so each change is alerted once.
+    5. `create_missing` (`Loop`) runs `createIndexes` for each missing index. Each one is a `Sequential` with `allowFailure`, so a unique index that cannot be built because of duplicate data does not stop the others.
+    6. `report_changes` (`If`) sends one Slack message for the changed definitions, the extras still in use and the indexes hidden by someone else. These are never touched.
+    7. `hide_proposal` (`If`), then `wait_hide` (`Pause`, 24 hours): on-call approves hiding the unused extras. `hide_loop` (`Loop`) re-checks each index, runs `collMod` with `hidden: true`, and saves the hidden-since date to the KV store.
+    8. `drop_proposal` (`If`), then `wait_drop` (`Pause`, 24 hours): proposed only on a later run, for indexes hidden for `hide_after_days` or more with no COLLSCAN on their collection since then. `drop_loop` (`Loop`) re-checks each index and then drops it.
+    9. `any_failed` (`If`) ends the run `WARNING` when one create, hide or drop failed.
+
+    The flow re-checks each index before every action. An index dropped while the approval waited is skipped with a message. An index that was read after the hide proposal stays visible. A changed definition is never dropped.
+
+    ## What you get
+    - A Slack message for each created, hidden or dropped index, and for each skipped or failed action.
+    - One Slack message per run for the changes that need a person, sent once per change.
+    - A flow output `summary` with the counts of missing indexes, reported changes, hide proposals and drop proposals.
+
+    ## Prerequisites
+    - A MongoDB 4.4+ replica set reachable from the Kestra worker.
+    - A user that can run `listIndexes`, `createIndexes`, `collMod`, `dropIndexes` and `$indexStats` on the database. Reading `system.profile` is optional: without it, the COLLSCAN check reports that no query data was checked.
+    - A Slack incoming webhook.
+    - The Python tasks install `pymongo` and `pyyaml` with `uv pip` into the Python of the Kestra image (`python3.12`).
+
+    ### Secrets
+    - `MONGODB_URI`: connection string of the replica set, with credentials if needed, for example `mongodb://user:password@host:27017/?replicaSet=rs0`
+    - `SLACK_WEBHOOK_URL`: incoming webhook for the alerts and the approval requests
+
+    ### Inputs
+    - `desired_indexes` (STRING, YAML): the spec. A mapping of collection name to a list of indexes, each with a `name`, `keys`, and optionally `unique`, `partialFilterExpression` and `expireAfterSeconds`.
+    - `database` (STRING, default `shop`): the database that holds the collections.
+    - `hide_after_days` (FLOAT, default 14): how long an index must stay hidden before a drop is proposed. Use a fraction in tests.
+    - `kestra_url` (STRING, default `http://localhost:8080`): base URL for the links in Slack.
+
+    ### Outputs
+    - `summary` (JSON): counts of missing indexes, reported changes, hide proposals and drop proposals. Empty on a FAILED run.
+
+    ## Quick start
+    1. Add the two secrets, and point `MONGODB_URI` at a replica set you can test against.
+    2. Put your spec in `desired_indexes`. The default is an example for `shop.orders` and `shop.sessions`.
+    3. Run with the defaults. A database that already has those indexes ends `SUCCESS` with no Slack message. A database without `orders_open_status` gets the index created, and the message is `Created shop.orders.orders_open_status (keys status:1, non-unique, partial {"status": "open"}). Built as an online index build.`
+    4. Add the webhook call from the deploy job, using the key in the trigger description, and enable the schedule once the flow points at production.
+
+    ## How to read the result
+    - `PAUSED` means the run waits for an approval. Read the Slack message, then resume with `approve` set to `true` or `false`. Without an answer within 24 hours, nothing is hidden or dropped.
+    - `WARNING` means one create, hide or drop failed. The Slack message names the index and the MongoDB error.
+    - `FAILED` names the task in the alert. For `validate`, the cause is a connection error or the spec.
+    - A proposal is made once per index. A declined or expired proposal is not made again. To propose it again, delete the `index_drift_state` key from the KV store.
+
+    ## How to extend
+    - Cover another database by running one copy of the flow per database, each with its own `database` input and spec.
+    - Send alerts to Microsoft Teams or PagerDuty by swapping the Slack tasks. The messages are already plain text.
+    - Route approvals per team by adding a `Switch` before each `Pause`. A deploy job can also start a run through the executions API with its own `desired_indexes` input, instead of the stored default.
+
+    ## Links
+    - [Python script plugin](https://kestra.io/plugins/plugin-script-python) for `validate`, `audit` and the actions
+    - [Slack plugin](https://kestra.io/plugins/plugin-slack) for the alerts
+    - [Core plugins](https://kestra.io/plugins/core) for `Pause`, `Loop`, `Sequential`, `If` and `kv.Set`
+    - [MongoDB hidden indexes](https://www.mongodb.com/docs/manual/core/index-hidden/)
+    - This blueprint has been created by [ram0verflow](https://github.com/ram0verflow)
+  tags:
+    - Infrastructure
+    - Data
+  subTags:
+    - Day 2 Operations
+    - Approval Gates
+  ee: false
+  demo: false
