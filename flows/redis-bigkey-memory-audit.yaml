@@ -553,7 +553,7 @@ errors:
     messageText: >-
       Redis big-key audit failed for {{ inputs.redis_host }}:{{ inputs.redis_port }} (execution {{ execution.id }}).
       Task: {{ (errorLogs() | jq('[.[] | select(.taskId != null)] | last | .taskId') | first) ?? 'unknown' }}.
-      Cause: {{ (errorLogs() | jq('[.[] | select(.level == "ERROR")] | last | .message') | first | split(' \[\[') | first) ?? 'see the execution logs' }}.
+      Cause: {{ (errorLogs() | jq('[.[] | select(.level == "ERROR" and ((.message // "") | test("Command failed|Exception") | not))] | last | .message') | first | split(' \[\[') | first) ?? 'see the execution logs' }}.
       Nothing was changed unless an approval was recorded in this execution. The baseline is only updated after a complete scan and a successful alert.
 
 outputs:
