@@ -1,0 +1,565 @@
+id: redis-bigkey-memory-audit
+namespace: company.team
+description: |
+  Find what is filling a Redis instance: the biggest keys, the key prefixes holding most of the memory,
+  and prefixes that keep gaining keys without a TTL. It also reads used_memory against maxmemory and the
+  eviction policy. The scan uses SCAN (never KEYS) and measures TYPE, TTL, MEMORY USAGE and length per key.
+  Slack hears about a change once: a new big key, a new memory hog, a prefix that started growing, memory
+  pressure, or the end of one of those. With on-call approval it sets a TTL on chosen no-TTL prefixes
+  (EXPIRE NX) or UNLINKs chosen big keys, re-reading each key right before acting.
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: on_demand
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: redis-bigkey-change-me
+    description: >-
+      Run an audit now, for example from a cron job or a runbook:
+      curl -X POST "http://localhost:8080/api/v1/executions/webhook/company.team/redis-bigkey-memory-audit/redis-bigkey-change-me"
+  - id: hourly_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "23 * * * *"
+    disabled: true
+    description: Hourly sweep as a backstop. Disabled until the first webhook run has been checked by a person.
+
+inputs:
+  - id: redis_host
+    type: STRING
+    defaults: 127.0.0.1
+    description: Host of the Redis instance to audit. Use the service name inside Docker Compose or Kubernetes.
+
+  - id: redis_port
+    type: INT
+    defaults: 6379
+    description: Port of the Redis instance. Must be between 1 and 65535.
+
+  - id: redis_db
+    type: INT
+    defaults: 0
+    description: Logical database to audit. SCAN and MEMORY USAGE only see this database.
+
+  - id: state_key
+    type: STRING
+    defaults: redis-bigkey-audit-main
+    description: KV key that stores this instance's baseline and the signatures already alerted on. Use one per Redis instance, so two instances never share a baseline.
+
+  - id: delimiter
+    type: STRING
+    defaults: ":"
+    description: Separator between key segments. Keys are grouped by their first prefix_depth segments, so "orders:42" belongs to prefix "orders".
+
+  - id: prefix_depth
+    type: INT
+    defaults: 1
+    description: How many delimiter-separated segments make up a prefix. Use 2 for keys like "user:session:<id>" when you want "user:session" as one group.
+
+  - id: scan_count
+    type: INT
+    defaults: 1000
+    description: COUNT hint for each SCAN call and the batch size for pipelined TYPE, TTL and MEMORY USAGE calls. Larger batches finish sooner but block the server longer per call.
+
+  - id: max_keys
+    type: INT
+    defaults: 1000000
+    description: Stop the scan after this many keys. A run that hits the limit alerts "partial scan" and keeps the previous baseline, because a partial sample cannot show growth.
+
+  - id: big_key_bytes
+    type: INT
+    defaults: 1048576
+    description: A key at or above this MEMORY USAGE estimate (default 1 MiB) is listed as a big key and offered for UNLINK. Lower it on small instances.
+
+  - id: prefix_share_pct
+    type: FLOAT
+    defaults: 20
+    description: A prefix holding at least this share of the sampled bytes is reported as a top memory holder.
+
+  - id: growth_min_keys
+    type: INT
+    defaults: 10000
+    description: A prefix counts as growing without TTL when it gained at least this many keys without an expiry since the previous run.
+
+  - id: memory_warn_pct
+    type: FLOAT
+    defaults: 80
+    description: Alert memory pressure when used_memory reaches this share of maxmemory. Ignored when maxmemory is 0 (no limit).
+
+  - id: top_keys
+    type: INT
+    defaults: 10
+    description: How many of the biggest keys to keep for the report. Big keys above big_key_bytes are always among them when there are fewer than this many.
+
+  - id: ttl_seconds
+    type: INT
+    defaults: 86400
+    description: TTL that an approved EXPIRE NX sets on keys without one, in seconds (default one day). It must be at least 60.
+
+  - id: ask_again_hours
+    type: INT
+    defaults: 24
+    description: An action that was offered but not chosen is offered again after this many hours while its problem remains. New problems are always offered at once.
+
+  - id: kestra_url
+    type: STRING
+    defaults: http://localhost:8080
+    description: Base URL of your Kestra UI, used for the approval link.
+
+variables:
+  # Shared by the three Python tasks. Standard library only, so no pip install and no Docker.
+  resp_client: |
+    import socket
+
+
+    class RedisError(Exception):
+        pass
+
+
+    class Redis:
+        def __init__(self, host, port, db, password, timeout=30):
+            self.sock = socket.create_connection((host, int(port)), timeout=timeout)
+            self.reader = self.sock.makefile('rb')
+            if password:
+                self.call('AUTH', password)
+            if int(db):
+                self.call('SELECT', int(db))
+
+        def _send(self, args):
+            parts = [b'*%d\r\n' % len(args)]
+            for a in args:
+                b = str(a).encode()
+                parts.append(b'$%d\r\n%s\r\n' % (len(b), b))
+            self.sock.sendall(b''.join(parts))
+
+        def _read(self):
+            line = self.reader.readline()
+            if not line:
+                raise ConnectionError('Redis closed the connection')
+            kind, body = line[:1], line[1:-2]
+            if kind == b'+':
+                return body.decode()
+            if kind == b'-':
+                return RedisError(body.decode())
+            if kind == b':':
+                return int(body)
+            if kind == b'$':
+                n = int(body)
+                if n < 0:
+                    return None
+                return self.reader.read(n + 2)[:-2].decode('utf-8', 'replace')
+            if kind == b'*':
+                n = int(body)
+                return None if n < 0 else [self._read() for _ in range(n)]
+            raise ValueError('unexpected reply: ' + line.decode('utf-8', 'replace'))
+
+        def call(self, *args):
+            self._send(args)
+            reply = self._read()
+            if isinstance(reply, RedisError):
+                raise reply
+            return reply
+
+        def pipeline(self, commands):
+            # Sends every command, then reads the replies in order. Errors come back as objects.
+            for c in commands:
+                self._send(c)
+            return [self._read() for _ in commands]
+
+tasks:
+  - id: check_inputs
+    type: io.kestra.plugin.core.flow.If
+    description: Reject impossible settings before any connection is made.
+    condition: "{{ inputs.redis_port < 1 or inputs.redis_port > 65535 or inputs.redis_db < 0 or inputs.scan_count < 1 or inputs.max_keys < 1 or inputs.prefix_depth < 1 or inputs.big_key_bytes < 1 or inputs.top_keys < 1 or inputs.memory_warn_pct > 100 or inputs.ttl_seconds < 60 or inputs.ask_again_hours < 1 or (inputs.delimiter ?? '') == '' }}"
+    then:
+      - id: invalid_input
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Invalid input: port must be 1-65535, redis_db >= 0, scan_count, max_keys, prefix_depth, big_key_bytes, top_keys and ask_again_hours >= 1, memory_warn_pct <= 100, ttl_seconds >= 60, and delimiter must not be empty."
+
+  - id: scan_keyspace
+    type: io.kestra.plugin.scripts.python.Script
+    description: >-
+      Reads INFO memory and stats, then walks the keyspace with SCAN in batches. For every key it reads
+      TYPE, TTL, MEMORY USAGE and the length of its type, and groups the results by prefix. It compares
+      the result with the KV baseline and writes the new baseline only for a complete scan.
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      resp.py: "{{ vars.resp_client }}"
+      config.json: "{{ {'host': inputs.redis_host, 'port': inputs.redis_port, 'db': inputs.redis_db, 'delimiter': inputs.delimiter, 'prefix_depth': inputs.prefix_depth, 'scan_count': inputs.scan_count, 'max_keys': inputs.max_keys, 'big_key_bytes': inputs.big_key_bytes, 'prefix_share_pct': inputs.prefix_share_pct, 'growth_min_keys': inputs.growth_min_keys, 'memory_warn_pct': inputs.memory_warn_pct, 'top_keys': inputs.top_keys, 'ask_again_hours': inputs.ask_again_hours} | toJson }}"
+      baseline.json: "{{ kv(inputs.state_key, errorOnMissing=false) | toJson }}"
+    env:
+      REDIS_PASSWORD: "{{ secret('REDIS_PASSWORD') }}"
+    script: |
+      import heapq
+      import json
+      import os
+      import sys
+      import time
+      from resp import Redis, RedisError
+
+      cfg = json.load(open('config.json'))
+      prev = json.load(open('baseline.json')) or {}
+      prev_sigs = prev.get('signatures', {})
+      prev_no_ttl = prev.get('no_ttl')
+      asked = prev.get('asked', {})
+      now = time.time()
+      LEN = {'string': 'STRLEN', 'list': 'LLEN', 'hash': 'HLEN', 'set': 'SCARD', 'zset': 'ZCARD', 'stream': 'XLEN'}
+
+
+      def emit(values):
+          print('::' + json.dumps({'outputs': values}) + '::')
+
+
+      def fmt(n):
+          if n >= 1048576:
+              return f'{n / 1048576:.1f} MB'
+          if n >= 1024:
+              return f'{n / 1024:.1f} KB'
+          return f'{n} B'
+
+
+      def parse_info(text):
+          info = {}
+          for line in text.splitlines():
+              if ':' in line and not line.startswith('#'):
+                  k, v = line.split(':', 1)
+                  info[k] = v
+          return info
+
+
+      def prefix_of(key):
+          parts = key.split(cfg['delimiter'])
+          if len(parts) <= cfg['prefix_depth']:
+              return '(no delimiter)'
+          return cfg['delimiter'].join(parts[:cfg['prefix_depth']])
+
+
+      try:
+          r = Redis(cfg['host'], cfg['port'], cfg['db'], os.environ.get('REDIS_PASSWORD', ''))
+          mem = parse_info(r.call('INFO', 'memory'))
+          stats = parse_info(r.call('INFO', 'stats'))
+          try:
+              policy = r.call('CONFIG', 'GET', 'maxmemory-policy')[1]
+          except RedisError:
+              policy = 'unknown (CONFIG is not allowed for this user)'
+
+          prefixes, top = {}, []
+          total = seen = 0
+          truncated = False
+          cursor = '0'
+          while True:
+              cursor, batch = r.call('SCAN', cursor, 'COUNT', cfg['scan_count'])
+              seen += len(batch)
+              if batch:
+                  types = r.pipeline([('TYPE', k) for k in batch])
+                  ttls = r.pipeline([('TTL', k) for k in batch])
+                  sizes = r.pipeline([('MEMORY', 'USAGE', k) for k in batch])
+                  with_len = [i for i, t in enumerate(types) if t in LEN]
+                  lens = dict(zip(with_len, r.pipeline([(LEN[types[i]], batch[i]) for i in with_len])))
+                  for i, key in enumerate(batch):
+                      size = sizes[i]
+                      if not isinstance(size, int):
+                          continue  # expired or deleted between SCAN and MEMORY USAGE
+                      length = lens.get(i)
+                      if not isinstance(length, int):
+                          length = None
+                      p = prefix_of(key)
+                      e = prefixes.setdefault(p, {'keys': 0, 'bytes': 0, 'no_ttl': 0})
+                      e['keys'] += 1
+                      e['bytes'] += size
+                      total += size
+                      if ttls[i] == -1:
+                          e['no_ttl'] += 1
+                      heapq.heappush(top, (size, key, types[i], length, ttls[i], p))
+                      if len(top) > cfg['top_keys']:
+                          heapq.heappop(top)
+              if cursor == '0':
+                  break
+              if seen >= cfg['max_keys']:
+                  truncated = True
+                  break
+
+          used = int(mem.get('used_memory', 0))
+          maxm = int(mem.get('maxmemory', 0))
+          used_pct = round(100.0 * used / maxm, 1) if maxm else None
+          evicted = stats.get('evicted_keys', '?')
+          for e in prefixes.values():
+              e['share'] = round(100.0 * e['bytes'] / total, 1) if total else 0.0
+
+          proposals = []
+          if truncated:
+              sigs = dict(prev_sigs)
+              sigs['scan:partial'] = f'Scan stopped at max_keys={cfg["max_keys"]} after {seen} keys. Prefix and growth checks were skipped and the baseline was kept'
+              no_ttl_base = prev_no_ttl
+          else:
+              sigs = {}
+              if maxm and used_pct >= cfg['memory_warn_pct']:
+                  sigs['memory:pressure'] = f'Memory pressure: used_memory {fmt(used)} is {used_pct}% of maxmemory {fmt(maxm)}, eviction policy {policy}'
+              for p, e in sorted(prefixes.items(), key=lambda x: -x[1]['bytes']):
+                  if e['share'] >= cfg['prefix_share_pct']:
+                      sigs['prefix:' + p] = f'Prefix {p}: {e["keys"]} keys, {fmt(e["bytes"])}, {e["share"]}% of the sampled memory'
+                  if prev_no_ttl is not None:
+                      delta = e['no_ttl'] - prev_no_ttl.get(p, 0)
+                      if delta >= cfg['growth_min_keys']:
+                          sigs['growth:' + p] = f'Prefix {p} keeps growing without a TTL: +{delta} keys since the last run, {e["no_ttl"]} without TTL now'
+                          proposals.append({'kind': 'prefix', 'name': p, 'signature': 'growth:' + p, 'no_ttl_keys': e['no_ttl'], 'added': delta})
+              for size, key, typ, length, ttl, p in sorted(top, reverse=True):
+                  if size >= cfg['big_key_bytes']:
+                      items = '' if length is None else f' with {length} items'
+                      ttl_text = 'no TTL' if ttl == -1 else f'TTL {ttl}s'
+                      sigs['bigkey:' + key] = f'Big key {key}: {typ}{items}, {fmt(size)}, {ttl_text}'
+                      proposals.append({'kind': 'key', 'name': key, 'signature': 'bigkey:' + key, 'type': typ, 'bytes': size})
+              no_ttl_base = {p: e['no_ttl'] for p, e in prefixes.items()}
+
+          new = [s for s in sigs if s not in prev_sigs]
+          cleared = [s for s in prev_sigs if s not in sigs]
+          # Ask a person about new actions, and about old ones again after ask_again_hours.
+          ask = [x for x in proposals if x['signature'] not in prev_sigs
+                 or now - asked.get(x['signature'], 0) >= cfg['ask_again_hours'] * 3600]
+          asked_state = {s: t for s, t in asked.items() if s in sigs}
+          asked_state.update({x['signature']: now for x in ask})
+          ask_text = '\n'.join(
+              f'- TTL on prefix {x["name"]}: {x["no_ttl_keys"]} keys without a TTL' if x['kind'] == 'prefix'
+              else f'- UNLINK key {x["name"]}: {x["type"]}, {fmt(x["bytes"])}'
+              for x in proposals)
+
+          lines = []
+          if new or cleared:
+              head = f'Redis {cfg["host"]}:{cfg["port"]} db {cfg["db"]}: {seen} keys scanned, {fmt(total)} sampled. used_memory {fmt(used)}'
+              head += f' of maxmemory {fmt(maxm)} ({used_pct}%)' if maxm else ' (maxmemory is 0, no limit)'
+              lines.append(head + f', policy {policy}, evicted_keys {evicted}')
+              lines += ['- NEW ' + sigs[s] for s in new]
+              lines += ['- CLEARED ' + prev_sigs[s] for s in cleared]
+
+          top_prefixes = [{'prefix': p, 'keys': e['keys'], 'bytes': e['bytes'], 'share': e['share'], 'no_ttl': e['no_ttl']}
+                          for p, e in sorted(prefixes.items(), key=lambda x: -x[1]['bytes'])[:5]]
+          top_keys = [{'key': k, 'type': t, 'length': n, 'bytes': s, 'ttl': ttl, 'prefix': p}
+                      for s, k, t, n, ttl, p in sorted(top, reverse=True)]
+          emit({
+              'message': '\n'.join(lines),
+              'changed': json.dumps(new + ['cleared: ' + c for c in cleared]),
+              'proposals': json.dumps(proposals),
+              'ask': json.dumps(ask),
+              'ask_text': ask_text,
+              'state': json.dumps({'signatures': sigs, 'no_ttl': no_ttl_base, 'asked': asked_state}),
+              'summary': json.dumps({'keys_scanned': seen, 'sampled_bytes': total, 'used_memory': used,
+                                     'maxmemory': maxm, 'used_pct': used_pct, 'policy': policy,
+                                     'evicted_keys': evicted, 'truncated': truncated,
+                                     'top_prefixes': top_prefixes, 'top_keys': top_keys}),
+          })
+      except Exception as e:
+          print(f'Redis audit could not read {cfg["host"]}:{cfg["port"]}: {e}', file=sys.stderr)
+          sys.exit(1)
+    retry:
+      type: exponential
+      interval: PT2S
+      maxInterval: PT30S
+      maxAttempts: 3
+
+  - id: changed_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Alert only when something is new or has cleared since the last run.
+    condition: "{{ fromJson(outputs.scan_keyspace.vars.changed) | length > 0 }}"
+    then:
+      - id: notify_changes
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: One message per change. The text names the key or prefix and what it means.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: "{{ outputs.scan_keyspace.vars.message }}"
+        retry:
+          type: exponential
+          interval: PT2S
+          maxInterval: PT30S
+          maxAttempts: 3
+
+  - id: save_state
+    type: io.kestra.plugin.core.kv.Set
+    description: >-
+      Store this run's signatures and per-prefix no-TTL counts. This runs after the alert, so a failed
+      Slack call leaves the old state in place and the next run alerts again. No TTL on this key: an
+      expired KV key would silently erase the baseline.
+    key: "{{ inputs.state_key }}"
+    kvType: JSON
+    value: "{{ outputs.scan_keyspace.vars.state }}"
+
+  - id: approval_gate
+    type: io.kestra.plugin.core.flow.If
+    description: Pause only when there is a new action, or an old one is due for another question. The form lists every open action.
+    condition: "{{ fromJson(outputs.scan_keyspace.vars.ask) | length > 0 }}"
+    then:
+      - id: notify_proposal
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Links to the paused execution. Nothing is changed until someone answers the form there.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        messageText: >-
+          Redis {{ inputs.redis_host }}:{{ inputs.redis_port }} db {{ inputs.redis_db }}: actions open for a decision. Choose within 2 hours, nothing changes otherwise: {{ inputs.kestra_url }}/ui/main/executions/{{ flow.namespace }}/{{ flow.id }}/{{ execution.id }}
+          {{ outputs.scan_keyspace.vars.ask_text }}
+
+      - id: wait_for_decision
+        type: io.kestra.plugin.core.flow.Pause
+        description: >-
+          Waits up to 2 hours. With no answer, the Pause resumes with empty choices and nothing is changed.
+        pauseDuration: PT2H
+        behavior: RESUME
+        onResume:
+          - id: actions
+            type: MULTISELECT
+            values:
+              - Set TTL on chosen prefixes
+              - UNLINK chosen big keys
+            required: false
+          - id: prefixes
+            type: STRING
+            description: Comma-separated prefixes from the report, e.g. seen. Names that were not reported are ignored.
+            required: false
+          - id: big_keys
+            type: STRING
+            description: Comma-separated big keys from the report, e.g. catalog:index. Names that were not reported are ignored.
+            required: false
+
+      - id: plan_actions
+        type: io.kestra.plugin.scripts.python.Script
+        description: Keeps only the names that were in the report, for the actions that were ticked. Makes no connection to Redis.
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        inputFiles:
+          proposals.json: "{{ outputs.scan_keyspace.vars.proposals }}"
+          choice.json: "{{ {'actions': (outputs.wait_for_decision.onResume.actions ?? []), 'prefixes': (outputs.wait_for_decision.onResume.prefixes ?? ''), 'big_keys': (outputs.wait_for_decision.onResume.big_keys ?? ''), 'ttl_seconds': inputs.ttl_seconds} | toJson }}"
+        script: |
+          import json
+
+          choice = json.load(open('choice.json'))
+          offered = {(p['kind'], p['name']): p for p in json.load(open('proposals.json'))}
+          actions = choice.get('actions') or []
+          targets, skipped = [], []
+
+
+          def names(text):
+              return [x.strip() for x in (text or '').split(',') if x.strip()]
+
+
+          if 'Set TTL on chosen prefixes' in actions:
+              for name in names(choice.get('prefixes')):
+                  if ('prefix', name) in offered:
+                      targets.append({'kind': 'prefix', 'name': name, 'ttl_seconds': choice['ttl_seconds']})
+                  else:
+                      skipped.append(f'prefix {name} was not in the report, so it was ignored')
+          if 'UNLINK chosen big keys' in actions:
+              for name in names(choice.get('big_keys')):
+                  p = offered.get(('key', name))
+                  if p:
+                      targets.append({'kind': 'key', 'name': name, 'type': p['type'], 'bytes': p['bytes']})
+                  else:
+                      skipped.append(f'key {name} was not in the report, so it was ignored')
+          print('::' + json.dumps({'outputs': {'targets': json.dumps(targets), 'skipped': json.dumps(skipped)}}) + '::')
+
+      - id: act_gate
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ fromJson(outputs.plan_actions.vars.targets) | length > 0 }}"
+        then:
+          - id: act_targets
+            type: io.kestra.plugin.core.flow.Loop
+            description: >-
+              One iteration per chosen target. Each target is re-read before it is changed: a key must still
+              exist, have the same type and still be big; a prefix key must still have no TTL (EXPIRE NX).
+              A failing target does not stop the others.
+            values: "{{ outputs.plan_actions.vars.targets }}"
+            concurrencyLimit: 1
+            outputs:
+              - id: result
+                type: STRING
+                value: "{% if outputs.apply_target.vars.result is defined %}{{ outputs.apply_target.vars.result }}{% else %}FAILED: see the execution logs for this target{% endif %}"
+            tasks:
+              - id: act_one
+                type: io.kestra.plugin.core.flow.Sequential
+                allowFailure: true
+                tasks:
+                  - id: apply_target
+                    type: io.kestra.plugin.scripts.python.Script
+                    taskRunner:
+                      type: io.kestra.plugin.core.runner.Process
+                    inputFiles:
+                      resp.py: "{{ vars.resp_client }}"
+                      config.json: "{{ {'host': inputs.redis_host, 'port': inputs.redis_port, 'db': inputs.redis_db, 'delimiter': inputs.delimiter, 'scan_count': inputs.scan_count, 'big_key_bytes': inputs.big_key_bytes} | toJson }}"
+                      target.json: "{{ fromJson(item.value) | toJson }}"
+                    env:
+                      REDIS_PASSWORD: "{{ secret('REDIS_PASSWORD') }}"
+                    script: |
+                      import json
+                      import os
+                      import sys
+                      from resp import Redis
+
+                      cfg = json.load(open('config.json'))
+                      target = json.load(open('target.json'))
+                      name = target['name']
+
+
+                      def emit(result):
+                          print('::' + json.dumps({'outputs': {'result': result}}) + '::')
+
+
+                      def escape(text):
+                          return ''.join('\\' + c if c in '*?[]^\\' else c for c in text)
+
+
+                      try:
+                          r = Redis(cfg['host'], cfg['port'], cfg['db'], os.environ.get('REDIS_PASSWORD', ''))
+                          if target['kind'] == 'key':
+                              typ = r.call('TYPE', name)
+                              size = r.call('MEMORY', 'USAGE', name)
+                              if typ == 'none' or size is None:
+                                  emit(f'SKIPPED {name}: the key no longer exists')
+                              elif typ != target['type']:
+                                  emit(f'SKIPPED {name}: it is now a {typ}, not the {target["type"]} that was shown')
+                              elif size < cfg['big_key_bytes']:
+                                  emit(f'SKIPPED {name}: it is now {size} bytes, under the big-key threshold of {cfg["big_key_bytes"]}')
+                              else:
+                                  r.call('UNLINK', name)
+                                  emit(f'UNLINKED {name} ({typ}, {size} bytes)')
+                          else:
+                              pattern = escape(name + cfg['delimiter']) + '*'
+                              cursor, scanned, set_ttl = '0', 0, 0
+                              while True:
+                                  cursor, batch = r.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', cfg['scan_count'])
+                                  scanned += len(batch)
+                                  if batch:
+                                      ttls = r.pipeline([('TTL', k) for k in batch])
+                                      replies = r.pipeline([('EXPIRE', k, target['ttl_seconds'], 'NX')
+                                                            for k, t in zip(batch, ttls) if t == -1])
+                                      set_ttl += sum(1 for x in replies if x == 1)
+                                  if cursor == '0':
+                                      break
+                              emit(f'TTL {target["ttl_seconds"]}s set on {set_ttl} keys under {name}{cfg["delimiter"]}* ({scanned} keys matched)')
+                      except Exception as e:
+                          print(f'Could not change {name}: {e}', file=sys.stderr)
+                          sys.exit(1)
+
+          - id: report_outcome
+            type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+            description: What each chosen target did, including the ones skipped at re-check.
+            url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+            messageText: >-
+              Redis {{ inputs.redis_host }}:{{ inputs.redis_port }} db {{ inputs.redis_db }}: actions finished ({{ execution.id }}).
+              {% for r in outputs.act_targets.outputs %}- {{ r.outputs.result }}
+              {% endfor %}{% for s in fromJson(outputs.plan_actions.vars.skipped) %}- {{ s }}
+              {% endfor %}Re-run the audit to confirm the new state.
+
+errors:
+  - id: alert_failure
+    type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+    url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+    messageText: >-
+      Redis big-key audit failed for {{ inputs.redis_host }}:{{ inputs.redis_port }} (execution {{ execution.id }}).
+      Task: {{ (errorLogs() | jq('[.[] | select(.taskId != null)] | last | .taskId') | first) ?? 'unknown' }}.
+      Cause: {{ (errorLogs() | jq('[.[] | select(.level == "ERROR")] | last | .message') | first | split(' \[\[') | first) ?? 'see the execution logs' }}.
+      Nothing was changed unless an approval was recorded in this execution. The baseline is only updated after a complete scan and a successful alert.
+
+outputs:
+  - id: summary
+    type: JSON
+    value: "{{ outputs.scan_keyspace.vars.summary ?? '{}' }}"
+  - id: actions_planned
+    type: JSON
+    value: "{{ outputs.plan_actions.vars.targets ?? '[]' }}"
