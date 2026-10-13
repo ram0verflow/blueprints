@@ -478,7 +478,7 @@ tasks:
       previous.json: "{{ (kv('etcd-drill-' ~ inputs.cluster_name, errorOnMissing=false) ?? {}) | toJson }}"
       health.json: "{{ outputs.probe.vars.report | toJson }}"
       drill.json: "{{ outputs.drill.vars.report | toJson }}"
-    script: &evaluate |
+    script: |
       from etcdlib import *
       prev = json.load(open("previous.json")) or {}
       if isinstance(prev, str):
@@ -811,7 +811,101 @@ tasks:
           etcdlib.py: "{{ vars.etcdlib }}"
           previous.json: "{{ outputs.evaluate.vars.state | toJson }}"
           health.json: "{{ outputs.recheck.vars.report | toJson }}"
-        script: *evaluate
+        script: |
+          from etcdlib import *
+          prev = json.load(open("previous.json")) or {}
+          if isinstance(prev, str):
+              prev = json.loads(prev)
+          h = json.load(open("health.json"))
+          d = json.load(open("drill.json")) if os.path.exists("drill.json") else {}
+          first, now = not prev, int(time.time())
+          lines = []
+          # alarm list needs quorum: without it, keep the alarms last seen
+          known = sorted("%s on %s" % (a["alarm"], a["member"]) for a in h["alarms"])
+          state = {"members": {}, "levels": {}, "alarms": known if h.get("alarms_known", True) else prev.get("alarms", []),
+                   "drill": d.get("verdict", prev.get("drill", "")), "asked_at": prev.get("asked_at", 0), "ask_key": prev.get("ask_key", "")}
+
+          for m in h["members"]:
+              status = "up" if m["up"] else "down"
+              state["members"][m["name"]] = status
+              old = prev.get("members", {}).get(m["name"])
+              if status == "down" and old != "down":
+                  lines.append("DOWN %s (%s): %s" % (m["name"], m["endpoint"] or "no client URL", m["error"]))
+              elif status == "up" and old == "down":
+                  lines.append("UP %s answers again" % m["name"])
+              if m["up"]:
+                  state["levels"][m["name"]] = m["level"]
+                  old_level = prev.get("levels", {}).get(m["name"], "ok")
+                  if m["level"] != old_level:
+                      if m["level"] == "ok":
+                          lines.append("OK %s database back to %s%% of its quota (%s of %s)" % (m["name"], m["used_percent"], mib(m["db_size"]), mib(m["quota"])))
+                      else:
+                          lines.append("%s %s database is %s%% of its quota: %s of %s (%s). %s of it is free pages that defragmentation returns. At 100%% etcd raises NOSPACE and refuses writes."
+                                       % (m["level"].upper(), m["name"], m["used_percent"], mib(m["db_size"]), mib(m["quota"]), m["quota_source"], mib(m["free_bytes"])))
+          for name in sorted(set(prev.get("members", {})) - set(state["members"])):
+              lines.append("REMOVED %s is no longer a member" % name)
+          if not h["quorum"] and (first or prev.get("quorum", True)):
+              lines.append("QUORUM LOST: only %d of %d voting members answer. Writes fail until a majority is back." % (h["voting_up"], h["voting"]))
+          elif h["voting_up"] < h["voting"] and h["quorum"] and any(l.startswith("DOWN") for l in lines):
+              spare = h["voting_up"] - (h["voting"] // 2 + 1)
+              lines.append("The cluster runs on %d of %d members and %s. Restart the member, or replace it (member remove, then member add with a fresh data dir)."
+                           % (h["voting_up"], h["voting"], "cannot lose another one without losing quorum" if spare == 0 else "can lose %d more" % spare))
+          state["quorum"] = h["quorum"]
+
+          for a in sorted(set(state["alarms"]) - set(prev.get("alarms", []))):
+              if a.startswith("NOSPACE"):
+                  lines.append("ALARM %s: the cluster only serves reads and deletes until it is disarmed. Recovery: compact, defragment every member, then disarm." % a)
+              elif a.startswith("CORRUPT"):
+                  lines.append("ALARM %s: members disagree on their data. Do not defragment. Find the member that diverged (etcdctl endpoint hashkv --cluster), remove it and add it back empty, or restore the cluster from a verified snapshot." % a)
+              else:
+                  lines.append("ALARM %s" % a)
+          for a in sorted(set(prev.get("alarms", [])) - set(state["alarms"])):
+              lines.append("CLEARED alarm %s" % a)
+
+          if d:
+              sn = d.get("snapshot", {})
+              if d["verdict"] == "PASS" and (first or prev.get("drill") != "PASS"):
+                  lines.append("%sRestore drill PASS: %s (live member %s) at revision %s (%s, %s key revisions in the file) restored in %ss and started in %ss; its %s keys and %s sampled keys match the live cluster at that revision.%s"
+                               % ("" if first else "RECOVERED ", d["mode"], d["source"], sn.get("revision"), sn.get("size"), sn.get("total_keys"),
+                                  d.get("restore_seconds"), d.get("start_seconds"), d.get("restored", {}).get("keys"), d.get("sample", {}).get("checked"),
+                                  (" Note: " + "; ".join(d["notes"])) if d["notes"] else ""))
+              elif d["verdict"] == "FAIL" and (first or prev.get("drill") != "FAIL" or prev.get("drill_problem") != d["problems"][0]):
+                  lines.append("Restore drill FAIL (%s, live member %s): %s. This backup would not give you the cluster back: fix it before you need it."
+                               % (d["mode"], d["source"], "; ".join(d["problems"])))
+              state["drill_problem"] = d["problems"][0] if d["problems"] else ""
+          else:
+              state["drill_problem"] = prev.get("drill_problem", "")
+
+          # maintenance offer
+          full = [m for m in h["members"] if m["up"] and m["level"] == "critical"]
+          fragmented = [m for m in h["members"] if m["up"] and m["free_percent"] >= {{ inputs.fragmentation_percent }} and m["free_bytes"] >= {{ inputs.fragmentation_min_mb }} * 1048576]
+          nospace = [a for a in state["alarms"] if a.startswith("NOSPACE")]
+          corrupt = [a for a in state["alarms"] if a.startswith("CORRUPT")]
+          ok, why = ready(h)
+          propose, proposal, blocked = False, "", ""
+          if full or fragmented or nospace:
+              if corrupt:
+                  blocked = "Maintenance is not offered while a CORRUPT alarm is active."
+              elif not ok:
+                  blocked = "Defragmentation is not offered while %s: blocking one more member could stall the cluster." % why
+              else:
+                  ask_key = json.dumps([state["levels"], state["alarms"], sorted(m["name"] for m in fragmented)], sort_keys=True)
+                  if ask_key != prev.get("ask_key") or now - prev.get("asked_at", 0) >= {{ inputs.ask_again_hours }} * 3600:
+                      propose = True
+                      state["asked_at"], state["ask_key"] = now, ask_key
+                      order = sorted((m for m in h["members"] if not m["leader"]), key=lambda m: m["name"]) + [m for m in h["members"] if m["leader"]]
+                      proposal = "\n".join(["- %s%s: %s file, %s in use, %s free (%s%% of quota)" % (m["name"], " (leader)" if m["leader"] else "",
+                                            mib(m["db_size"]), mib(m["db_in_use"]), mib(m["free_bytes"]), m["used_percent"]) for m in order])
+                      proposal += ("\nCompaction keeps only the latest version of each key up to revision %s (watchers older than that must re-list; Kubernetes compacts by itself every 5 minutes)."
+                                   "\nDefragmentation goes one member at a time, followers first, the leader last, and checks the cluster between members. Each member is blocked while it defragments."
+                                   % h["revision"])
+                      if nospace:
+                          proposal += "\nThe NOSPACE alarm is disarmed only if every member is then below %s%% of its quota." % {{ inputs.quota_warn_percent }}
+              if blocked and (first or prev.get("blocked") != blocked):
+                  lines.append(blocked)
+          state["blocked"] = blocked
+          print("\n".join(lines) or "no change")
+          output(changes=lines, state=state, propose=propose, proposal=proposal)
 
       - id: save_settled
         type: io.kestra.plugin.core.kv.Set
