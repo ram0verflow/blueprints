@@ -52,13 +52,13 @@ The recruiter's form:
   - A bad email or job ID gets HTTP 422.
   - Unknown or closed jobs fail with the KV key to add.
   - Missing consent fails and stores nothing.
-- **Retries are safe.** A duplicate ends `WARNING`. A failed screening is marked `failed`, so sending the application again retries it (scenario 1 was first run against a template bug, then sent again successfully).
+- **Retries are safe.** A duplicate ends `WARNING`. A failed screening is marked `failed`, so sending the application again retries it (seen during development: an application that failed on a template error went through when sent again).
 - **Guardrails.** A résumé over 60,000 characters never reaches the model.
 - **No HTML from user input.** Emails are plain text.
 
 ## Why it is different
 
-No blueprint in the catalog or in open PRs screens job applications. The closest, `dropbox-hr-resume-intake`, files résumés from a Dropbox folder into an archive. `ai-candidate…`-style tasks exist in no flow; the catalog's AI examples score tickets, leads, receipts and contracts. This blueprint covers a hiring decision, with evidence checks, injection resistance and a mandatory human decision (checked 2026-10-14 against main and PRs up to #1576).
+No blueprint in the catalog or in open PRs screens job applications. The closest, `dropbox-hr-resume-intake`, files résumés from a Dropbox folder into an archive. The catalog's AI review flows score support tickets, leads, receipts and contracts, not applications. This blueprint covers a hiring decision, with evidence checks, injection resistance and a mandatory human decision (checked 2026-10-14 against main and PRs up to #1576).
 
 ## Hacktober requirements
 
