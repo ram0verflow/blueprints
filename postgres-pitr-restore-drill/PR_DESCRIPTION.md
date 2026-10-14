@@ -63,15 +63,15 @@ Each run produced exactly one Slack message on a local sink.
 | Case | Result |
 |---|---|
 | A. s3, `target_time` = T | ✅ PASSED in 7 s; 4 WAL segments; check "2000 orders" ok |
-| B. s3, no `target_time` | ✅ Replayed the whole archive including the DELETE: 0 orders, so a check expecting 2000 fails and the drill reports it |
+| B. s3, no `target_time` | ✅ PASSED in 9 s; replayed the whole archive including the DELETE; check "0 orders (the DELETE was replayed too)" ok. Shows why the target time matters |
 | C. WAL segment 4 removed from the bucket | ✅ FAILED at `restore`: "recovery stopped: recovery ended before configured recovery target was reached" |
 | D. Wrong `s3_base_prefix` | ✅ FAILED: "no base.tar.gz under s3://drill/base/nope/ (expected pg_basebackup -Ft -z output)" |
-| E. A check on a table that does not exist | ✅ FAILED: "check could not run: ERROR: relation \"no_such_table\" does not exist"; the passing check is listed as ok |
+| E. A check on a table that does not exist | ✅ FAILED at `drill_failed`: "a check failed on the recovered database … FAILED: check could not run: ERROR: relation no_such_table does not exist" |
 | F. Demo, `rto_minutes: 0` | ✅ FAILED: "the restore took 2 s, over the 0 min RTO" |
 | G. s3 mode without a bucket | ✅ FAILED at `missing_bucket` before any container started |
 | H. Webhook | ✅ Key from the secret → HTTP 200, demo drill PASSED in 2 s; the old placeholder key → HTTP 404 |
 | I. SLA (test copy with a 15 s deadline and a `sleep 40`), run twice | ✅ Killed, labelled `drill: deadline_exceeded`, exactly one `afterExecution` alert each time, no `errors` alert |
-| J. Demo mode with no AWS secrets defined | ✅ PASSED; 2000 orders recovered |
+| J. Demo mode, Kestra restarted with no AWS secrets defined | ✅ PASSED in 2 s; 2000 orders recovered |
 
 The KV entry `pitr_drill_last_good` was written by every passing run and quoted in later failure messages ("Last good drill: 2026-10-14T09:49:20Z").
 
