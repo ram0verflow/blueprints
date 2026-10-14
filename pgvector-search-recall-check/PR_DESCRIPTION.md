@@ -92,11 +92,11 @@ A table of the same 30,000 rows also ran with the table's own rows as query vect
 ## Notes
 
 - **HNSW builds are not deterministic.** The demo's recall at the default setting was 0.88 to 0.94 across rebuilds in testing, always below the 0.95 target. The docs say "8 to 12%" instead of a fixed number.
-- **What "current setting" means.** The value comes from `pg_db_role_setting`: the role in this database, then the role, then the database, then the pgvector default. A value the application sets per session with `SET` is invisible to the catalog. The docs say to use `app_role`.
+- **What "current setting" means.** The value comes from `pg_db_role_setting`: the role in this database, then the role, then the database, then the pgvector default. A value the application sets per session with `SET` is invisible to the catalog.
 - **Cost.** Each query vector costs one exact scan of the table. 100 queries on 30,000 64-dimension vectors took under a second. On large tables, lower `sample_size`, run off-peak, or point `POSTGRES_URL` at a replica. A setting can only be applied on the primary.
 - **Kestra notes found while building:**
   - `Queries` keeps everything after a `CREATE FUNCTION` as one statement, so the measurement is a `DO` block followed by a `SELECT`, not a temporary function.
   - Named parameters treat `::` as a parameter marker, so `find_sql` uses `CAST()`.
-  - Both are documented in the flow.
+  - The `CAST()` rule has a comment in the flow.
 - **Not tested:** pgvector before 0.8, `halfvec`/`sparsevec`/`bit` columns (the operator mapping covers them), and tables over a few hundred thousand rows.
 - Tags: `AI, Data`; the tag validator passes on this branch.
